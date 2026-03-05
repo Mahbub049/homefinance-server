@@ -22,7 +22,7 @@ function monthStartEnd(year, m) {
   return { start, end };
 }
 
-async function totalBalanceAtDate(familyObjectId, cutoffDate, openingSum) {
+async function totalBalanceAtDate(familyObjectId, cutoffDate, openingSum, includedAccountIds) {
   const cutoff = new Date(cutoffDate);
 
   const inflowRows = await Transaction.aggregate([
@@ -30,7 +30,7 @@ async function totalBalanceAtDate(familyObjectId, cutoffDate, openingSum) {
       $match: {
         familyId: familyObjectId,
         date: { $lt: cutoff },
-        toAccountId: { $ne: null },
+        toAccountId: { $in: includedAccountIds },
         txType: { $in: ["income", "transfer"] },
       },
     },
@@ -42,7 +42,7 @@ async function totalBalanceAtDate(familyObjectId, cutoffDate, openingSum) {
       $match: {
         familyId: familyObjectId,
         date: { $lt: cutoff },
-        fromAccountId: { $ne: null },
+        fromAccountId: { $in: includedAccountIds },
         txType: { $in: ["expense", "transfer"] },
       },
     },
@@ -103,10 +103,17 @@ router.get("/", requireAuth, requireFamily, async (req, res) => {
       .select("_id")
       .lean();
 
-    const allActiveAccounts = await Account.find({ familyId: familyObjectId, isActive: true })
-      .select("openingBalance")
+    const cashAccounts = await Account.find({
+      familyId: familyObjectId,
+      isActive: true,
+      type: { $ne: "savings" }, // ✅ exclude savings from Opening/Closing
+    })
+      .select("_id openingBalance")
       .lean();
-    const openingSum = allActiveAccounts.reduce((s, a) => s + Number(a.openingBalance || 0), 0);
+
+    const cashAccountIds = cashAccounts.map((a) => a._id);
+
+    const openingSum = cashAccounts.reduce((s, a) => s + Number(a.openingBalance || 0), 0);
 
     const savingsIds = savingsAccounts.map((x) => x._id);
 
@@ -143,9 +150,19 @@ router.get("/", requireAuth, requireFamily, async (req, res) => {
     for (let i = 1; i <= 12; i++) {
       const m = monthKey(year, i);
       const { start, end } = monthStartEnd(year, i);
+      const openingBalance = await totalBalanceAtDate(
+        familyObjectId,
+        start,
+        openingSum,
+        cashAccountIds
+      );
 
-      const openingBalance = await totalBalanceAtDate(familyObjectId, start, openingSum);
-      const closingBalance = await totalBalanceAtDate(familyObjectId, end, openingSum);
+      const closingBalance = await totalBalanceAtDate(
+        familyObjectId,
+        end,
+        openingSum,
+        cashAccountIds
+      );
 
       const income = round2(txMap[m]?.income || 0);
       const expense = round2(txMap[m]?.expense || 0);
