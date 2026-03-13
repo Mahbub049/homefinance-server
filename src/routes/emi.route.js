@@ -50,31 +50,93 @@ function diffMonthsInclusive(start, now, end) {
   return (cy - sy) * 12 + (cm - sm) + 1;
 }
 
+function diffMonths(start, end) {
+  const [sy, sm] = start.split("-").map(Number);
+  const [ey, em] = end.split("-").map(Number);
+  return (ey - sy) * 12 + (em - sm);
+}
+
+function getRegularMonthlyAmount(plan) {
+  const total = Number(plan.totalPayable || 0);
+  const months = Number(plan.months || 0);
+  if (months <= 0) return 0;
+  return Math.ceil(total / months);
+}
+
+function getLastInstallmentAmount(plan) {
+  const total = Number(plan.totalPayable || 0);
+  const months = Number(plan.months || 0);
+  if (months <= 0) return 0;
+  if (months === 1) return round2(total);
+
+  const regular = getRegularMonthlyAmount(plan);
+  return round2(total - regular * (months - 1));
+}
+
+function getInstallmentAmountForMonth(plan, targetMonth) {
+  const months = Number(plan.months || 0);
+  if (months <= 0) return 0;
+
+  const idx = diffMonths(plan.startMonth, targetMonth) + 1;
+
+  if (idx < 1 || idx > months) return 0;
+
+  if (idx === months) {
+    return getLastInstallmentAmount(plan);
+  }
+
+  return getRegularMonthlyAmount(plan);
+}
+
+function getExpectedPaidAmountUntilMonth(plan, nowMonth) {
+  if (!plan.startMonth || !plan.endMonth) return 0;
+  if (nowMonth < plan.startMonth) return 0;
+
+  const total = Number(plan.totalPayable || 0);
+  const months = Number(plan.months || 0);
+  if (months <= 0) return 0;
+
+  let cur = nowMonth;
+  if (cur > plan.endMonth) cur = plan.endMonth;
+
+  const expectedMonths = diffMonthsInclusive(plan.startMonth, cur, plan.endMonth);
+  if (expectedMonths <= 0) return 0;
+
+  const regular = getRegularMonthlyAmount(plan);
+  const last = getLastInstallmentAmount(plan);
+
+  if (expectedMonths >= months) {
+    return round2(total);
+  }
+
+  return round2(expectedMonths * regular);
+}
+
 async function computePlanStats(familyId, plan) {
   const monthNow = currentMonth();
 
   const totalMonths = Number(plan.months || 0);
-  const monthly = Number(plan.monthlyAmount || 0);
+  const totalPayable = Number(plan.totalPayable || 0);
 
-  const paidCount = await EMIInstallment.countDocuments({
+  const paidInstallments = await EMIInstallment.find({
     familyId,
     planId: plan._id,
     status: "paid",
-  });
+  }).select("amount");
+
+  const paidCount = paidInstallments.length;
+  const actualPaidAmount = round2(
+    paidInstallments.reduce((sum, item) => sum + Number(item.amount || 0), 0)
+  );
 
   const remainingMonths = Math.max(0, totalMonths - paidCount);
-  const remaining = round2(remainingMonths * monthly);
-  const progress = totalMonths > 0 ? round2((paidCount / totalMonths) * 100) : 0;
+  const remaining = Math.max(0, round2(totalPayable - actualPaidAmount));
+  const progress =
+    totalPayable > 0 ? round2((actualPaidAmount / totalPayable) * 100) : 0;
 
   let behindBy = 0;
   if (plan.startMonth && monthNow >= plan.startMonth) {
-    const expectedPaidMonths = diffMonthsInclusive(
-      plan.startMonth,
-      monthNow,
-      plan.endMonth
-    );
-    const expectedPaidAmount = round2(expectedPaidMonths * monthly);
-    const actualPaidAmount = round2(paidCount * monthly);
+    const expectedPaidAmount = getExpectedPaidAmountUntilMonth(plan, monthNow);
     behindBy = Math.max(0, round2(expectedPaidAmount - actualPaidAmount));
   }
 
@@ -100,9 +162,12 @@ router.get("/plans", requireAuth, requireFamily, async (req, res) => {
   const withStats = [];
   for (const p of plans) {
     const stats = await computePlanStats(req.familyId, p);
-    withStats.push({ ...p.toObject(), stats });
+    withStats.push({
+      ...p.toObject(),
+      monthlyAmount: getRegularMonthlyAmount(p),
+      stats,
+    });
   }
-
   res.json({ ok: true, plans: withStats });
 });
 
@@ -156,7 +221,7 @@ router.post("/plans", requireAuth, requireFamily, async (req, res) => {
   }
 
   const tp = round2(op + (op * pct) / 100);
-  const monthlyAmount = round2(tp / m);
+  const monthlyAmount = Math.ceil(tp / m);
   const endMonth = addMonths(startMonth, m - 1);
 
   const plan = await EMIPlan.create({
@@ -290,7 +355,7 @@ async function generateInstallmentsForPlans({
 
     if (exists) continue;
 
-    const amount = Number(p.monthlyAmount);
+    const amount = getInstallmentAmountForMonth(p, month);
     const dueDate = new Date(`${month}-01`);
 
     let splitRows = [];

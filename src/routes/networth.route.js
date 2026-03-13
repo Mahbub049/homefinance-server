@@ -112,9 +112,11 @@ router.get("/", requireAuth, requireFamily, async (req, res) => {
     // Liabilities
     // ================================
     // Remaining EMI liability = sum( totalPayable - paidCount * monthlyAmount ) for active plans
-    const plans = await EMIPlan.find({ familyId: req.familyId, status: "active" }).select(
-      "totalPayable monthlyAmount"
-    );
+    // Remaining EMI liability = sum(totalPayable - actual paid installment amounts) for active plans
+    const plans = await EMIPlan.find({
+      familyId: req.familyId,
+      status: "active",
+    }).select("totalPayable");
 
     let remainingEMI = 0;
     let totalPayableActive = 0;
@@ -123,13 +125,17 @@ router.get("/", requireAuth, requireFamily, async (req, res) => {
     for (const p of plans) {
       totalPayableActive += Number(p.totalPayable || 0);
 
-      const paidCount = await EMIInstallment.countDocuments({
+      const paidInstallments = await EMIInstallment.find({
         familyId: req.familyId,
         planId: p._id,
         status: "paid",
-      });
+      }).select("amount");
 
-      const paid = Number(p.monthlyAmount || 0) * paidCount;
+      const paid = paidInstallments.reduce(
+        (sum, item) => sum + Number(item.amount || 0),
+        0
+      );
+
       totalPaidActive += paid;
 
       const rem = Math.max(0, Number(p.totalPayable || 0) - paid);
