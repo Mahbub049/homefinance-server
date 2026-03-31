@@ -8,6 +8,7 @@ import LedgerEntry from "../models/LedgerEntry.js";
 import Split from "../models/Split.js";
 import FamilyMember from "../models/FamilyMember.js";
 import Category from "../models/Category.js";
+import Account from "../models/Account.js";
 
 import {
   splitEqual,
@@ -21,6 +22,14 @@ const router = Router();
 
 function currentMonth() {
   const d = new Date();
+  const y = d.getFullYear();
+  const m = String(d.getMonth() + 1).padStart(2, "0");
+  return `${y}-${m}`;
+}
+
+function monthKey(dateInput) {
+  const d = new Date(dateInput);
+  if (Number.isNaN(d.getTime())) return null;
   const y = d.getFullYear();
   const m = String(d.getMonth() + 1).padStart(2, "0");
   return `${y}-${m}`;
@@ -153,7 +162,6 @@ async function computePlanStats(familyId, plan) {
 // Plans
 // =====================
 
-// list plans (+ stats)
 router.get("/plans", requireAuth, requireFamily, async (req, res) => {
   const plans = await EMIPlan.find({ familyId: req.familyId }).sort({
     createdAt: -1,
@@ -171,7 +179,6 @@ router.get("/plans", requireAuth, requireFamily, async (req, res) => {
   res.json({ ok: true, plans: withStats });
 });
 
-// create plan
 router.post("/plans", requireAuth, requireFamily, async (req, res) => {
   const {
     productName,
@@ -180,7 +187,6 @@ router.post("/plans", requireAuth, requireFamily, async (req, res) => {
     purchaseDate,
     originalPrice,
     emiCharge,
-    totalPayable, // ignored; server computes
     months,
     startMonth,
     splitType,
@@ -248,7 +254,6 @@ router.post("/plans", requireAuth, requireFamily, async (req, res) => {
   res.json({ ok: true, plan });
 });
 
-// update status
 router.put("/plans/:id/status", requireAuth, requireFamily, async (req, res) => {
   const { status } = req.body || {};
 
@@ -360,8 +365,7 @@ async function generateInstallmentsForPlans({
 
     let splitRows = [];
     if (p.splitType === "equal") splitRows = splitEqual(amount, userIds);
-    if (p.splitType === "personal")
-      splitRows = splitPersonal(amount, p.personalUserId);
+    if (p.splitType === "personal") splitRows = splitPersonal(amount, p.personalUserId);
     if (p.splitType === "ratio") splitRows = splitRatio(amount, p.ratios);
     if (p.splitType === "fixed") splitRows = splitFixed(amount, p.fixed);
 
@@ -407,7 +411,6 @@ async function generateInstallmentsForPlans({
   };
 }
 
-// Generate all active plan bills for a month
 router.post("/generate", requireAuth, requireFamily, async (req, res) => {
   try {
     const { month, expenseCategoryId } = req.body || {};
@@ -433,7 +436,6 @@ router.post("/generate", requireAuth, requireFamily, async (req, res) => {
   }
 });
 
-// Generate only one selected plan bill for a month
 router.post("/plans/:id/generate", requireAuth, requireFamily, async (req, res) => {
   try {
     const { month, expenseCategoryId } = req.body || {};
@@ -486,7 +488,7 @@ router.post("/plans/:id/generate", requireAuth, requireFamily, async (req, res) 
 
 // update installment status
 router.put("/installments/:id/status", requireAuth, requireFamily, async (req, res) => {
-  const { status, paidByUserId } = req.body || {};
+  const { status, paidByUserId, fromAccountId, paidDate } = req.body || {};
 
   if (!["pending", "paid"].includes(status)) {
     return res.status(400).json({ ok: false, message: "Invalid status" });
@@ -495,7 +497,7 @@ router.put("/installments/:id/status", requireAuth, requireFamily, async (req, r
   const inst = await EMIInstallment.findOne({
     _id: req.params.id,
     familyId: req.familyId,
-  });
+  }).populate("planId", "productName");
 
   if (!inst) {
     return res.status(404).json({ ok: false, message: "Installment not found" });
@@ -513,35 +515,92 @@ router.put("/installments/:id/status", requireAuth, requireFamily, async (req, r
   }
 
   if (status === "paid") {
+    if (!paidByUserId) {
+      return res.status(400).json({ ok: false, message: "paidByUserId is required" });
+    }
+
+    if (!fromAccountId) {
+      return res.status(400).json({ ok: false, message: "fromAccountId is required" });
+    }
+
+    const payDate = paidDate ? new Date(paidDate) : new Date();
+    if (Number.isNaN(payDate.getTime())) {
+      return res.status(400).json({ ok: false, message: "Invalid paidDate" });
+    }
+
+    const txMonth = monthKey(payDate);
+    if (!txMonth) {
+      return res.status(400).json({ ok: false, message: "Invalid paidDate" });
+    }
+
+    const account = await Account.findOne({
+      _id: fromAccountId,
+      familyId: req.familyId,
+      isActive: true,
+    }).select("_id name type");
+
+    if (!account) {
+      return res.status(400).json({ ok: false, message: "Selected account not found" });
+    }
+
+    if (!["cash", "bank", "wallet"].includes(account.type)) {
+      return res.status(400).json({
+        ok: false,
+        message: "EMI payment must be made from a cash, bank, or wallet account",
+      });
+    }
+
+    const amount = Number(inst.amount || entry.amountTotal || 0);
+    const txNote =
+      entry.note ||
+      `EMI: ${inst?.planId?.productName || "Installment payment"}`;
+
     if (!inst.transactionId) {
       const tx = await Transaction.create({
         familyId: req.familyId,
         txType: "expense",
-        date: entry.date,
-        month: inst.month,
+        date: payDate,
+        month: txMonth,
         categoryId: entry.categoryId,
-        amount: Number(inst.amount || entry.amountTotal || 0),
-        note: entry.note || "EMI Payment",
-        fromAccountId: null,
+        amount,
+        note: txNote,
+        fromAccountId,
         toAccountId: null,
-        paidByUserId: paidByUserId || req.user.userId,
+        paidByUserId,
         receivedByUserId: null,
         createdByUserId: req.user.userId,
       });
 
       inst.transactionId = tx._id;
+    } else {
+      await Transaction.updateOne(
+        { _id: inst.transactionId, familyId: req.familyId },
+        {
+          $set: {
+            date: payDate,
+            month: txMonth,
+            categoryId: entry.categoryId,
+            amount,
+            note: txNote,
+            fromAccountId,
+            toAccountId: null,
+            paidByUserId,
+            receivedByUserId: null,
+          },
+        }
+      );
     }
 
     inst.status = "paid";
-    inst.paidByUserId = paidByUserId || req.user.userId;
-    inst.paidAt = new Date();
+    inst.paidByUserId = paidByUserId;
+    inst.paidAt = payDate;
     await inst.save();
 
     await LedgerEntry.updateOne(
       { _id: entry._id, familyId: req.familyId },
       {
         $set: {
-          paidByUserId: inst.paidByUserId,
+          paidByUserId,
           sourceType: "transaction",
           sourceId: inst.transactionId,
         },
@@ -567,7 +626,13 @@ router.put("/installments/:id/status", requireAuth, requireFamily, async (req, r
 
     await LedgerEntry.updateOne(
       { _id: entry._id, familyId: req.familyId },
-      { $set: { paidByUserId: null, sourceType: "", sourceId: null } }
+      {
+        $set: {
+          paidByUserId: null,
+          sourceType: "",
+          sourceId: null,
+        },
+      }
     );
 
     return res.json({ ok: true, installment: inst });
