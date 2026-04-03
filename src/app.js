@@ -24,6 +24,7 @@ import networthRouter from "./routes/networth.route.js";
 import walletRouter from "./routes/wallet.route.js";
 import monthBalanceRouter from "./routes/monthBalance.route.js";
 import yearOverviewRouter from "./routes/yearOverview.route.js";
+import plannedPurchaseRouter from "./routes/plannedPurchase.route.js";
 
 const app = express();
 
@@ -58,6 +59,7 @@ app.use("/api/networth", networthRouter);
 app.use("/api/wallet", walletRouter);
 app.use("/api/month-balance", monthBalanceRouter);
 app.use("/api/year-overview", yearOverviewRouter);
+app.use("/api/planned-purchases", plannedPurchaseRouter);
 
 // default route
 app.get("/", (req, res) => {
