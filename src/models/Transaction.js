@@ -53,6 +53,33 @@ const transactionSchema = new mongoose.Schema(
       default: null,
     },
 
+    // Only for expense transactions.
+    // This preserves how the expense should be shared in Ledger/Wallet summaries.
+    split: {
+      type: {
+        type: String,
+        enum: ["personal", "equal", "ratio", "fixed"],
+        default: undefined,
+      },
+      personalUserId: {
+        type: mongoose.Schema.Types.ObjectId,
+        ref: "User",
+        default: null,
+      },
+      ratios: [
+        {
+          userId: { type: mongoose.Schema.Types.ObjectId, ref: "User", required: true },
+          ratio: { type: Number, required: true },
+        },
+      ],
+      fixed: [
+        {
+          userId: { type: mongoose.Schema.Types.ObjectId, ref: "User", required: true },
+          amount: { type: Number, required: true },
+        },
+      ],
+    },
+
     createdByUserId: {
       type: mongoose.Schema.Types.ObjectId,
       ref: "User",

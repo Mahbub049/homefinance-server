@@ -21,6 +21,220 @@ function toMonthString(d) {
   return `${y}-${m}`;
 }
 
+function cleanOptionalObjectId(value) {
+  return value ? value : null;
+}
+
+async function prepareGroceryPayload(req) {
+  const {
+    txnDate,
+    shopName,
+    location,
+    paymentMethodId,
+    cardLabelId,
+    categoryId,
+    paidByUserId,
+    fromAccountId,
+    discountTotal = 0,
+    deliveryFee = 0,
+    vatAmount = 0,
+    vatIncluded = true,
+    note = "",
+    items = [],
+    split,
+  } = req.body || {};
+
+  if (
+    !txnDate ||
+    !categoryId ||
+    !paidByUserId ||
+    !fromAccountId ||
+    !Array.isArray(items) ||
+    items.length === 0 ||
+    !split?.type
+  ) {
+    const err = new Error("Missing required fields");
+    err.status = 400;
+    throw err;
+  }
+
+  const dateObj = new Date(txnDate);
+  if (Number.isNaN(dateObj.getTime())) {
+    const err = new Error("Invalid transaction date");
+    err.status = 400;
+    throw err;
+  }
+
+  const members = await FamilyMember.find({ familyId: req.familyId });
+  const userIds = members.map((m) => String(m.userId));
+
+  if (!userIds.includes(String(paidByUserId))) {
+    const err = new Error("Invalid paidBy");
+    err.status = 400;
+    throw err;
+  }
+
+  let itemsSubtotal = 0;
+
+  const preparedItems = items.map((it) => {
+    const name = String(it.name || "").trim();
+    if (!name) {
+      const err = new Error("Every item must have a name");
+      err.status = 400;
+      throw err;
+    }
+
+    const qty = Number(it.qty || 0);
+    const unitPrice = Number(it.unitPrice || 0);
+    const itemDiscount = Number(it.itemDiscount || 0);
+
+    if (!Number.isFinite(qty) || qty < 0) {
+      const err = new Error("Invalid item quantity");
+      err.status = 400;
+      throw err;
+    }
+
+    if (!Number.isFinite(unitPrice) || unitPrice < 0) {
+      const err = new Error("Invalid item unit price");
+      err.status = 400;
+      throw err;
+    }
+
+    if (!Number.isFinite(itemDiscount) || itemDiscount < 0) {
+      const err = new Error("Invalid item discount");
+      err.status = 400;
+      throw err;
+    }
+
+    const productStartDate = it.productStartDate ? new Date(it.productStartDate) : null;
+    const productEndDate = it.productEndDate ? new Date(it.productEndDate) : null;
+
+    const lineTotal = round2(qty * unitPrice - itemDiscount);
+    if (lineTotal < 0) {
+      const err = new Error("Item discount cannot be greater than item total");
+      err.status = 400;
+      throw err;
+    }
+
+    itemsSubtotal += lineTotal;
+
+    return {
+      name,
+      brand: String(it.brand || "").trim(),
+      unit: String(it.unit || "").trim(),
+      qty,
+      unitPrice,
+      productStartDate: productStartDate && !Number.isNaN(productStartDate.getTime()) ? productStartDate : null,
+      productEndDate: productEndDate && !Number.isNaN(productEndDate.getTime()) ? productEndDate : null,
+      itemDiscount,
+      lineTotal,
+      note: String(it.note || "").trim(),
+    };
+  });
+
+  itemsSubtotal = round2(itemsSubtotal);
+
+  let totalPayable = itemsSubtotal - Number(discountTotal || 0) + Number(deliveryFee || 0);
+  if (!vatIncluded) totalPayable += Number(vatAmount || 0);
+  totalPayable = round2(totalPayable);
+
+  if (totalPayable <= 0) {
+    const err = new Error("Total payable must be > 0");
+    err.status = 400;
+    throw err;
+  }
+
+  let splitRows = [];
+  if (split.type === "equal") splitRows = splitEqual(totalPayable, userIds);
+  if (split.type === "personal") splitRows = splitPersonal(totalPayable, split.personalUserId);
+  if (split.type === "ratio") splitRows = splitRatio(totalPayable, split.ratios || []);
+  if (split.type === "fixed") splitRows = splitFixed(totalPayable, split.fixed || []);
+
+  if (!Array.isArray(splitRows) || splitRows.length === 0) {
+    const err = new Error("Invalid split data");
+    err.status = 400;
+    throw err;
+  }
+
+  const invalidSplitUser = splitRows.find((r) => !userIds.includes(String(r.userId)));
+  if (invalidSplitUser) {
+    const err = new Error("Invalid split member");
+    err.status = 400;
+    throw err;
+  }
+
+  const month = toMonthString(dateObj);
+  const groceryNote = `Grocery: ${shopName || "Transaction"}`;
+
+  return {
+    dateObj,
+    month,
+    groceryNote,
+    splitRows,
+    preparedItems,
+    groceryFields: {
+      familyId: req.familyId,
+      txnDate: dateObj,
+      month,
+      shopName: String(shopName || "").trim(),
+      location: String(location || "").trim(),
+      paymentMethodId: cleanOptionalObjectId(paymentMethodId),
+      cardLabelId: cleanOptionalObjectId(cardLabelId),
+      categoryId,
+      paidByUserId,
+      fromAccountId,
+      discountTotal: Number(discountTotal || 0),
+      deliveryFee: Number(deliveryFee || 0),
+      vatAmount: Number(vatAmount || 0),
+      vatIncluded: !!vatIncluded,
+      itemsSubtotal,
+      totalPayable,
+      note: String(note || "").trim(),
+      createdByUserId: req.user.userId,
+    },
+    transactionFields: {
+      familyId: req.familyId,
+      txType: "expense",
+      date: dateObj,
+      month,
+      categoryId,
+      amount: totalPayable,
+      note: groceryNote,
+      fromAccountId,
+      toAccountId: null,
+      paidByUserId,
+      receivedByUserId: null,
+      createdByUserId: req.user.userId,
+    },
+    ledgerFields: {
+      familyId: req.familyId,
+      entryType: "expense",
+      financialType: "living",
+      module: "grocery",
+      date: dateObj,
+      month,
+      categoryId,
+      amountTotal: totalPayable,
+      paidByUserId,
+      receivedByUserId: null,
+      note: groceryNote,
+      createdByUserId: req.user.userId,
+    },
+  };
+}
+
+async function replaceSplits({ familyId, ledgerEntryId, splitRows }) {
+  await Split.deleteMany({ familyId, ledgerEntryId });
+  await Split.insertMany(
+    splitRows.map((r) => ({
+      familyId,
+      ledgerEntryId,
+      userId: r.userId,
+      shareAmount: r.shareAmount,
+    }))
+  );
+}
+
 // GET /api/grocery?month=YYYY-MM
 router.get("/", requireAuth, requireFamily, async (req, res) => {
   const { month } = req.query;
@@ -56,170 +270,33 @@ router.get("/", requireAuth, requireFamily, async (req, res) => {
 // POST /api/grocery
 router.post("/", requireAuth, requireFamily, async (req, res) => {
   try {
-    const {
-      txnDate,
-      shopName,
-      location,
-      paymentMethodId,
-      cardLabelId,
-      categoryId,
-      paidByUserId,
-      fromAccountId,
-      discountTotal = 0,
-      deliveryFee = 0,
-      vatAmount = 0,
-      vatIncluded = true,
-      note = "",
-      items = [],
-      split,
-    } = req.body || {};
+    const data = await prepareGroceryPayload(req);
 
-    if (
-      !txnDate ||
-      !categoryId ||
-      !paidByUserId ||
-      !fromAccountId ||
-      !Array.isArray(items) ||
-      items.length === 0 ||
-      !split?.type
-    ) {
-      return res.status(400).json({ ok: false, message: "Missing required fields" });
-    }
-
-    const members = await FamilyMember.find({ familyId: req.familyId });
-    const userIds = members.map((m) => String(m.userId));
-
-    if (!userIds.includes(String(paidByUserId))) {
-      return res.status(400).json({ ok: false, message: "Invalid paidBy" });
-    }
-
-    // compute item totals
-    let itemsSubtotal = 0;
-    const preparedItems = items.map((it) => {
-      const qty = Number(it.qty || 0);
-      const unitPrice = Number(it.unitPrice || 0);
-      const itemDiscount = Number(it.itemDiscount || 0);
-
-      const productStartDate = it.productStartDate ? new Date(it.productStartDate) : null;
-      const productEndDate = it.productEndDate ? new Date(it.productEndDate) : null;
-
-      const lineTotal = round2(qty * unitPrice - itemDiscount);
-      itemsSubtotal += lineTotal;
-
-      return {
-        name: (it.name || "").trim(),
-        brand: (it.brand || "").trim(),
-        unit: (it.unit || "").trim(),
-        qty,
-        unitPrice,
-        productStartDate: productStartDate && !Number.isNaN(productStartDate.getTime()) ? productStartDate : null,
-        productEndDate: productEndDate && !Number.isNaN(productEndDate.getTime()) ? productEndDate : null,
-        itemDiscount,
-        lineTotal,
-        note: (it.note || "").trim(),
-      };
-    });
-
-    itemsSubtotal = round2(itemsSubtotal);
-
-    // total payable
-    let totalPayable = itemsSubtotal - Number(discountTotal || 0) + Number(deliveryFee || 0);
-    if (!vatIncluded) totalPayable += Number(vatAmount || 0);
-    totalPayable = round2(totalPayable);
-
-    if (totalPayable <= 0) return res.status(400).json({ ok: false, message: "Total payable must be > 0" });
-
-    // compute split rows
-    let splitRows = [];
-    if (split.type === "equal") splitRows = splitEqual(totalPayable, userIds);
-    if (split.type === "personal") splitRows = splitPersonal(totalPayable, split.personalUserId);
-    if (split.type === "ratio") splitRows = splitRatio(totalPayable, split.ratios);
-    if (split.type === "fixed") splitRows = splitFixed(totalPayable, split.fixed);
-
-    if (!Array.isArray(splitRows) || splitRows.length === 0) {
-      return res.status(400).json({ ok: false, message: "Invalid split data" });
-    }
-
-    const dateObj = new Date(txnDate);
-    const month = toMonthString(dateObj);
-
-    // ✅ Grocery transaction id আগে বানাই (Grocery module primary key)
     const groceryTxnId = new mongoose.Types.ObjectId();
 
-    // ✅ Transactions module record (source-of-truth for month totals)
-    const tx = await Transaction.create({
-      familyId: req.familyId,
-      txType: "expense",
-      date: dateObj,
-      month,
-      categoryId,
-      amount: totalPayable,
-      note: `Grocery: ${shopName || "Transaction"}`,
-      fromAccountId,
-      toAccountId: null,
-      paidByUserId,
-      receivedByUserId: null,
-      createdByUserId: req.user.userId,
-    });
+    const tx = await Transaction.create(data.transactionFields);
 
-    // ✅ Ledger entry + splits
-    // IMPORTANT: Link LedgerEntry to the underlying Transaction.
-    // This prevents /api/ledger/rebuild from creating a duplicate LedgerEntry.
     const entry = await LedgerEntry.create({
-      familyId: req.familyId,
-      entryType: "expense",
-      financialType: "living",
-      module: "grocery",
-      date: dateObj,
-      month,
-      categoryId,
-      amountTotal: totalPayable,
-      paidByUserId,
-      receivedByUserId: null,
-      note: `Grocery: ${shopName || "Transaction"}`,
+      ...data.ledgerFields,
       sourceType: "transaction",
       sourceId: tx._id,
-      createdByUserId: req.user.userId,
     });
 
-    await Split.insertMany(
-      splitRows.map((r) => ({
-        familyId: req.familyId,
-        ledgerEntryId: entry._id,
-        userId: r.userId,
-        shareAmount: r.shareAmount,
-      }))
-    );
+    await replaceSplits({
+      familyId: req.familyId,
+      ledgerEntryId: entry._id,
+      splitRows: data.splitRows,
+    });
 
-    // ✅ Grocery module transaction (use the same _id we generated)
     const txn = await GroceryTransaction.create({
       _id: groceryTxnId,
-      familyId: req.familyId,
-      txnDate: dateObj,
-      month,
-      shopName: (shopName || "").trim(),
-      location: (location || "").trim(),
-      paymentMethodId: paymentMethodId || null,
-      cardLabelId: cardLabelId || null,
-      categoryId,
-      paidByUserId,
-      fromAccountId,
-
+      ...data.groceryFields,
       transactionId: tx._id,
       ledgerEntryId: entry._id,
-
-      discountTotal: Number(discountTotal || 0),
-      deliveryFee: Number(deliveryFee || 0),
-      vatAmount: Number(vatAmount || 0),
-      vatIncluded: !!vatIncluded,
-      itemsSubtotal,
-      totalPayable,
-      note: (note || "").trim(),
-      createdByUserId: req.user.userId,
     });
 
     await GroceryItem.insertMany(
-      preparedItems.map((it) => ({
+      data.preparedItems.map((it) => ({
         familyId: req.familyId,
         txnId: txn._id,
         ...it,
@@ -228,7 +305,88 @@ router.post("/", requireAuth, requireFamily, async (req, res) => {
 
     res.json({ ok: true, txnId: txn._id });
   } catch (e) {
-    res.status(500).json({ ok: false, message: e?.message || "Save failed" });
+    res.status(e?.status || 500).json({ ok: false, message: e?.message || "Save failed" });
+  }
+});
+
+// PUT /api/grocery/:id
+// Updates grocery transaction AND keeps Transaction + LedgerEntry + Split rows synced automatically.
+router.put("/:id", requireAuth, requireFamily, async (req, res) => {
+  try {
+    const txn = await GroceryTransaction.findOne({ _id: req.params.id, familyId: req.familyId });
+    if (!txn) return res.status(404).json({ ok: false, message: "Not found" });
+
+    const data = await prepareGroceryPayload(req);
+
+    let tx = null;
+    if (txn.transactionId) {
+      tx = await Transaction.findOne({ _id: txn.transactionId, familyId: req.familyId });
+    }
+
+    if (tx) {
+      await Transaction.updateOne(
+        { _id: tx._id, familyId: req.familyId },
+        { $set: data.transactionFields }
+      );
+    } else {
+      tx = await Transaction.create(data.transactionFields);
+    }
+
+    let entry = null;
+    if (txn.ledgerEntryId) {
+      entry = await LedgerEntry.findOne({ _id: txn.ledgerEntryId, familyId: req.familyId });
+    }
+
+    if (entry) {
+      await LedgerEntry.updateOne(
+        { _id: entry._id, familyId: req.familyId },
+        {
+          $set: {
+            ...data.ledgerFields,
+            sourceType: "transaction",
+            sourceId: tx._id,
+          },
+        }
+      );
+    } else {
+      entry = await LedgerEntry.create({
+        ...data.ledgerFields,
+        sourceType: "transaction",
+        sourceId: tx._id,
+      });
+    }
+
+    await replaceSplits({
+      familyId: req.familyId,
+      ledgerEntryId: entry._id,
+      splitRows: data.splitRows,
+    });
+
+    await GroceryTransaction.updateOne(
+      { _id: txn._id, familyId: req.familyId },
+      {
+        $set: {
+          ...data.groceryFields,
+          transactionId: tx._id,
+          ledgerEntryId: entry._id,
+        },
+      }
+    );
+
+    await GroceryItem.deleteMany({ familyId: req.familyId, txnId: txn._id });
+    await GroceryItem.insertMany(
+      data.preparedItems.map((it) => ({
+        familyId: req.familyId,
+        txnId: txn._id,
+        ...it,
+      }))
+    );
+
+    res.json({ ok: true, txnId: txn._id });
+  } catch (e) {
+    // Duplicate source unique index can happen only if old duplicate ledger rows exist.
+    // Run /api/ledger/normalize for that month if you see duplicate key error.
+    res.status(e?.status || 500).json({ ok: false, message: e?.message || "Update failed" });
   }
 });
 

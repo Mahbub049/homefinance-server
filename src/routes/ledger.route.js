@@ -10,6 +10,7 @@ import Transaction from "../models/Transaction.js";
 import GroceryTransaction from "../models/GroceryTransaction.js";
 import FixedInstance from "../models/FixedInstance.js";
 import EMIInstallment from "../models/EMIInstallment.js";
+import { splitEqual, splitPersonal, splitRatio, splitFixed } from "../utils/splitCalc.js";
 
 const router = Router();
 
@@ -198,29 +199,57 @@ router.post("/rebuild", requireAuth, requireFamily, async (req, res) => {
           });
         }
       } else {
-        // ✅ expense → split equally among all family members (wallet needs this)
+        // ✅ expense → rebuild using the transaction split config when available.
+        // Fallback remains Personal by paidByUserId for older manual expenses.
         const amt = Number(t.amount || 0);
-        const n = Math.max(memberUserIds.length, 1);
-        const per = Math.floor((amt / n) * 100) / 100; // 2-dec floor
-        let used = 0;
+        const txSplit = t.split || {};
+        let splitRows = [];
 
-        for (let i = 0; i < memberUserIds.length; i++) {
-          const uid = memberUserIds[i];
-          let share = per;
-          used += share;
-
-          // give remainder to last member (so sum matches exactly)
-          if (i === memberUserIds.length - 1) {
-            share = Math.round((amt - (per * (n - 1)) + Number.EPSILON) * 100) / 100;
+        try {
+          if (txSplit.type === "equal") {
+            splitRows = splitEqual(amt, memberUserIds);
+          } else if (txSplit.type === "ratio" && Array.isArray(txSplit.ratios) && txSplit.ratios.length) {
+            splitRows = splitRatio(
+              amt,
+              txSplit.ratios.map((r) => ({
+                userId: r.userId,
+                ratio: Number(r.ratio || 0),
+              }))
+            );
+          } else if (txSplit.type === "fixed" && Array.isArray(txSplit.fixed) && txSplit.fixed.length) {
+            splitRows = splitFixed(
+              amt,
+              txSplit.fixed.map((f) => ({
+                userId: f.userId,
+                amount: Number(f.amount || 0),
+              }))
+            );
+          } else {
+            const personalUserId = txSplit.personalUserId || t.paidByUserId;
+            if (personalUserId && memberUserIds.includes(String(personalUserId))) {
+              splitRows = splitPersonal(amt, personalUserId);
+            }
           }
+        } catch {
+          splitRows = [];
+        }
 
-          await Split.create({
+        if (!splitRows.length && t.paidByUserId && memberUserIds.includes(String(t.paidByUserId))) {
+          splitRows = splitPersonal(amt, t.paidByUserId);
+        }
+
+        if (!splitRows.length) {
+          splitRows = splitEqual(amt, memberUserIds);
+        }
+
+        await Split.insertMany(
+          splitRows.map((row) => ({
             familyId,
             ledgerEntryId: entry._id,
-            userId: uid,
-            shareAmount: share,
-          });
-        }
+            userId: row.userId,
+            shareAmount: Number(row.shareAmount || 0),
+          }))
+        );
       }
       createdFromTransactions += 1;
     }

@@ -30,6 +30,26 @@ function normalizeDate(inputDate, month) {
   return new Date(`${month}-01`);
 }
 
+async function getExpenseFinancialType({ familyId, categoryId }) {
+  let financialType = "living";
+
+  try {
+    const cat = await Category.findOne({ _id: categoryId, familyId }).select("financialType kind");
+    if (cat) {
+      financialType = cat.financialType || (cat.kind === "income" ? "income" : "living");
+    }
+  } catch {
+    // keep default
+  }
+
+  return financialType;
+}
+
+function normalizeId(value) {
+  if (!value) return null;
+  return value._id || value.id || value;
+}
+
 async function buildSplitRows({ familyId, template, amount }) {
   const members = await FamilyMember.find({ familyId });
   const userIds = members.map((m) => String(m.userId));
@@ -71,16 +91,7 @@ async function createLedgerForFixed({
   createdByUserId,
   splitRows,
 }) {
-  let financialType = "living";
-
-  try {
-    const cat = await Category.findOne({ _id: categoryId, familyId }).select("financialType kind");
-    if (cat) {
-      financialType = cat.financialType || (cat.kind === "income" ? "income" : "living");
-    }
-  } catch {
-    // ignore
-  }
+  const financialType = await getExpenseFinancialType({ familyId, categoryId });
 
   const entry = await LedgerEntry.create({
     familyId,
@@ -505,6 +516,170 @@ router.post("/instances/:id/post", requireAuth, requireFamily, async (req, res) 
     .populate("fromAccountId", "name type");
 
   res.json({ ok: true, item: populated });
+});
+
+
+router.put("/instances/:id", requireAuth, requireFamily, async (req, res) => {
+  const { amount, note, paidByUserId, fromAccountId, paymentDate, month: selectedMonth } = req.body || {};
+
+  const inst = await FixedInstance.findOne({
+    _id: req.params.id,
+    familyId: req.familyId,
+  }).populate("templateId");
+
+  if (!inst) return res.status(404).json({ ok: false, message: "Not found" });
+
+  const template = inst.templateId;
+  if (!template) {
+    return res.status(400).json({ ok: false, message: "Template missing" });
+  }
+
+  if (!paidByUserId) {
+    return res.status(400).json({ ok: false, message: "paidByUserId required" });
+  }
+
+  if (!fromAccountId) {
+    return res.status(400).json({ ok: false, message: "fromAccountId required" });
+  }
+
+  const date = normalizeDate(paymentDate, selectedMonth || inst.month);
+  const txMonth = toMonthString(date);
+
+  const finalAmount = Number(
+    amount !== undefined && amount !== null && amount !== ""
+      ? amount
+      : inst.amount || template.defaultAmount
+  );
+
+  if (!finalAmount || finalAmount <= 0) {
+    return res.status(400).json({ ok: false, message: "Amount must be > 0" });
+  }
+
+  const cleanNote = String(note || "").trim();
+  const finalNote = cleanNote ? `Fixed: ${template.name} — ${cleanNote}` : `Fixed: ${template.name}`;
+
+  const splitRows = await buildSplitRows({
+    familyId: req.familyId,
+    template,
+    amount: finalAmount,
+  });
+
+  let tx = null;
+
+  if (inst.transactionId) {
+    tx = await Transaction.findOne({ _id: inst.transactionId, familyId: req.familyId });
+  }
+
+  if (!tx) {
+    const txId = normalizeId(inst.transactionId) || new mongoose.Types.ObjectId();
+
+    tx = await Transaction.create({
+      _id: txId,
+      familyId: req.familyId,
+      txType: "expense",
+      date,
+      month: txMonth,
+      categoryId: template.categoryId,
+      amount: finalAmount,
+      note: finalNote,
+      fromAccountId,
+      toAccountId: null,
+      paidByUserId,
+      receivedByUserId: null,
+      createdByUserId: req.user.userId,
+    });
+
+    inst.transactionId = tx._id;
+  } else {
+    tx.txType = "expense";
+    tx.date = date;
+    tx.month = txMonth;
+    tx.categoryId = template.categoryId;
+    tx.amount = finalAmount;
+    tx.note = finalNote;
+    tx.fromAccountId = fromAccountId;
+    tx.toAccountId = null;
+    tx.paidByUserId = paidByUserId;
+    tx.receivedByUserId = null;
+    await tx.save();
+  }
+
+  const financialType = await getExpenseFinancialType({
+    familyId: req.familyId,
+    categoryId: template.categoryId,
+  });
+
+  let entry = null;
+
+  if (inst.ledgerEntryId) {
+    entry = await LedgerEntry.findOne({ _id: inst.ledgerEntryId, familyId: req.familyId });
+  }
+
+  if (!entry && tx?._id) {
+    entry = await LedgerEntry.findOne({
+      familyId: req.familyId,
+      sourceType: "transaction",
+      sourceId: tx._id,
+    });
+  }
+
+  if (!entry) {
+    entry = await createLedgerForFixed({
+      familyId: req.familyId,
+      txId: tx._id,
+      date,
+      month: txMonth,
+      categoryId: template.categoryId,
+      amount: finalAmount,
+      paidByUserId,
+      note: finalNote,
+      createdByUserId: req.user.userId,
+      splitRows,
+    });
+  } else {
+    entry.entryType = "expense";
+    entry.financialType = financialType;
+    entry.module = "fixed";
+    entry.date = date;
+    entry.month = txMonth;
+    entry.categoryId = template.categoryId;
+    entry.amountTotal = finalAmount;
+    entry.paidByUserId = paidByUserId;
+    entry.receivedByUserId = null;
+    entry.note = finalNote;
+    entry.sourceType = "transaction";
+    entry.sourceId = tx._id;
+    await entry.save();
+
+    await Split.deleteMany({ familyId: req.familyId, ledgerEntryId: entry._id });
+    await Split.insertMany(
+      splitRows.map((r) => ({
+        familyId: req.familyId,
+        ledgerEntryId: entry._id,
+        userId: r.userId,
+        shareAmount: r.shareAmount,
+      }))
+    );
+  }
+
+  inst.amount = finalAmount;
+  inst.note = cleanNote;
+  inst.date = date;
+  inst.month = selectedMonth || inst.month;
+  inst.paidByUserId = paidByUserId;
+  inst.fromAccountId = fromAccountId;
+  inst.ledgerEntryId = entry._id;
+  inst.transactionId = tx._id;
+  inst.status = "posted";
+  await inst.save();
+
+  const populated = await FixedInstance.findById(inst._id)
+    .populate("templateId")
+    .populate("transactionId")
+    .populate("paidByUserId", "name")
+    .populate("fromAccountId", "name type");
+
+  return res.json({ ok: true, item: populated, updated: true });
 });
 
 router.delete("/instances/:id", requireAuth, requireFamily, async (req, res) => {

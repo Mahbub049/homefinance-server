@@ -7,6 +7,9 @@ import Transaction from "../models/Transaction.js";
 import Category from "../models/Category.js";
 import LedgerEntry from "../models/LedgerEntry.js";
 import Split from "../models/Split.js";
+import FamilyMember from "../models/FamilyMember.js";
+
+import { splitEqual, splitPersonal, splitRatio, splitFixed } from "../utils/splitCalc.js";
 
 function monthKey(dateInput) {
   const d = new Date(dateInput);
@@ -14,6 +17,12 @@ function monthKey(dateInput) {
   const y = d.getFullYear();
   const m = String(d.getMonth() + 1).padStart(2, "0");
   return `${y}-${m}`;
+}
+
+function cleanId(value) {
+  if (!value) return null;
+  if (typeof value === "object") return value._id || value.id || null;
+  return value;
 }
 
 async function resolveFinancialType({ familyId, txType, categoryId }) {
@@ -31,8 +40,122 @@ async function resolveFinancialType({ familyId, txType, categoryId }) {
   return financialType;
 }
 
+async function buildExpenseSplit({ familyId, amount, paidByUserId, split }) {
+  const members = await FamilyMember.find({ familyId }).select("userId").lean();
+  const userIds = members.map((m) => String(m.userId));
+
+  if (userIds.length === 0) {
+    const err = new Error("No family members found for split");
+    err.status = 400;
+    throw err;
+  }
+
+  const splitType = split?.type || "personal";
+
+  if (!["personal", "equal", "ratio", "fixed"].includes(splitType)) {
+    const err = new Error("Invalid split type");
+    err.status = 400;
+    throw err;
+  }
+
+  let splitRows = [];
+  let normalizedSplit = {
+    type: splitType,
+    personalUserId: null,
+    ratios: [],
+    fixed: [],
+  };
+
+  if (splitType === "equal") {
+    splitRows = splitEqual(amount, userIds);
+    normalizedSplit = { ...normalizedSplit, type: "equal" };
+  }
+
+  if (splitType === "personal") {
+    const personalUserId = cleanId(split?.personalUserId) || paidByUserId;
+    if (!personalUserId || !userIds.includes(String(personalUserId))) {
+      const err = new Error("Select a valid member for Personal split");
+      err.status = 400;
+      throw err;
+    }
+
+    splitRows = splitPersonal(amount, personalUserId);
+    normalizedSplit = {
+      ...normalizedSplit,
+      type: "personal",
+      personalUserId,
+    };
+  }
+
+  if (splitType === "ratio") {
+    const ratios = Array.isArray(split?.ratios)
+      ? split.ratios.map((r) => ({
+          userId: cleanId(r.userId),
+          ratio: Number(r.ratio || 0),
+        }))
+      : [];
+
+    if (ratios.length === 0) {
+      const err = new Error("Ratio split requires member ratios");
+      err.status = 400;
+      throw err;
+    }
+
+    const invalid = ratios.find((r) => !r.userId || !userIds.includes(String(r.userId)));
+    if (invalid) {
+      const err = new Error("Invalid member in Ratio split");
+      err.status = 400;
+      throw err;
+    }
+
+    splitRows = splitRatio(amount, ratios);
+    normalizedSplit = {
+      ...normalizedSplit,
+      type: "ratio",
+      ratios,
+    };
+  }
+
+  if (splitType === "fixed") {
+    const fixed = Array.isArray(split?.fixed)
+      ? split.fixed.map((f) => ({
+          userId: cleanId(f.userId),
+          amount: Number(f.amount || 0),
+        }))
+      : [];
+
+    if (fixed.length === 0) {
+      const err = new Error("Fixed split requires member amounts");
+      err.status = 400;
+      throw err;
+    }
+
+    const invalid = fixed.find((f) => !f.userId || !userIds.includes(String(f.userId)));
+    if (invalid) {
+      const err = new Error("Invalid member in Fixed split");
+      err.status = 400;
+      throw err;
+    }
+
+    splitRows = splitFixed(amount, fixed);
+    normalizedSplit = {
+      ...normalizedSplit,
+      type: "fixed",
+      fixed,
+    };
+  }
+
+  if (!Array.isArray(splitRows) || splitRows.length === 0) {
+    const err = new Error("Invalid split data");
+    err.status = 400;
+    throw err;
+  }
+
+  return { splitRows, normalizedSplit };
+}
+
 async function syncTransactionLedger({ req, tx, payload }) {
-  const { txType, date, categoryId, amount, note, paidByUserId, receivedByUserId } = payload;
+  const { txType, date, categoryId, amount, note, paidByUserId, receivedByUserId, splitRows } = payload;
   const mk = monthKey(date);
   const amt = Number(amount || 0);
 
@@ -97,18 +220,33 @@ async function syncTransactionLedger({ req, tx, payload }) {
   }
 
   await Split.deleteMany({ familyId: req.familyId, ledgerEntryId: le._id });
-  const splitUserId = txType === "income" ? receivedByUserId : paidByUserId;
-  if (splitUserId) {
-    await Split.create({
-      familyId: req.familyId,
-      ledgerEntryId: le._id,
-      userId: splitUserId,
-      shareAmount: amt,
-    });
+
+  let rowsToInsert = [];
+  if (txType === "income" && receivedByUserId) {
+    rowsToInsert = [{ userId: receivedByUserId, shareAmount: amt }];
+  }
+
+  if (txType === "expense") {
+    rowsToInsert = Array.isArray(splitRows) && splitRows.length > 0
+      ? splitRows
+      : paidByUserId
+        ? [{ userId: paidByUserId, shareAmount: amt }]
+        : [];
+  }
+
+  if (rowsToInsert.length > 0) {
+    await Split.insertMany(
+      rowsToInsert.map((r) => ({
+        familyId: req.familyId,
+        ledgerEntryId: le._id,
+        userId: r.userId,
+        shareAmount: Number(r.shareAmount || 0),
+      }))
+    );
   }
 }
 
-function validateTransactionInput(body = {}) {
+async function validateTransactionInput(req, body = {}) {
   const {
     txType,
     date,
@@ -119,6 +257,7 @@ function validateTransactionInput(body = {}) {
     toAccountId,
     paidByUserId,
     receivedByUserId,
+    split,
   } = body;
 
   if (!txType || !["income", "expense", "transfer"].includes(txType)) {
@@ -154,6 +293,24 @@ function validateTransactionInput(body = {}) {
     }
   }
 
+  let normalizedSplit = null;
+  let splitRows = [];
+
+  if (txType === "expense") {
+    try {
+      const result = await buildExpenseSplit({
+        familyId: req.familyId,
+        amount: amt,
+        paidByUserId,
+        split,
+      });
+      normalizedSplit = result.normalizedSplit;
+      splitRows = result.splitRows;
+    } catch (e) {
+      return { ok: false, message: e?.message || "Invalid split data" };
+    }
+  }
+
   return {
     ok: true,
     payload: {
@@ -167,6 +324,8 @@ function validateTransactionInput(body = {}) {
       toAccountId: txType === "expense" ? null : toAccountId || null,
       paidByUserId: txType === "expense" ? paidByUserId || null : null,
       receivedByUserId: txType === "income" ? receivedByUserId || null : null,
+      split: txType === "expense" ? normalizedSplit : null,
+      splitRows,
     },
   };
 }
@@ -189,7 +348,10 @@ router.get("/", requireAuth, requireFamily, async (req, res) => {
     .populate("fromAccountId")
     .populate("toAccountId")
     .populate("paidByUserId")
-    .populate("receivedByUserId");
+    .populate("receivedByUserId")
+    .populate("split.personalUserId", "name")
+    .populate("split.ratios.userId", "name")
+    .populate("split.fixed.userId", "name");
 
   res.json({ ok: true, items });
 });
@@ -218,7 +380,7 @@ router.get("/summary", requireAuth, requireFamily, async (req, res) => {
 // Create
 router.post("/", requireAuth, requireFamily, async (req, res) => {
   try {
-    const check = validateTransactionInput(req.body || {});
+    const check = await validateTransactionInput(req, req.body || {});
     if (!check.ok) return res.status(400).json({ ok: false, message: check.message });
 
     const payload = check.payload;
@@ -235,6 +397,7 @@ router.post("/", requireAuth, requireFamily, async (req, res) => {
       toAccountId: payload.toAccountId,
       paidByUserId: payload.paidByUserId,
       receivedByUserId: payload.receivedByUserId,
+      split: payload.split,
       createdByUserId: req.user.userId,
     });
 
@@ -253,7 +416,7 @@ router.put("/:id", requireAuth, requireFamily, async (req, res) => {
     const existing = await Transaction.findOne({ _id: id, familyId: req.familyId });
     if (!existing) return res.status(404).json({ ok: false, message: "Not found" });
 
-    const check = validateTransactionInput(req.body || {});
+    const check = await validateTransactionInput(req, req.body || {});
     if (!check.ok) return res.status(400).json({ ok: false, message: check.message });
 
     const payload = check.payload;
@@ -268,6 +431,7 @@ router.put("/:id", requireAuth, requireFamily, async (req, res) => {
     existing.toAccountId = payload.toAccountId;
     existing.paidByUserId = payload.paidByUserId;
     existing.receivedByUserId = payload.receivedByUserId;
+    existing.split = payload.split;
     await existing.save();
 
     await syncTransactionLedger({ req, tx: existing, payload });
@@ -278,7 +442,6 @@ router.put("/:id", requireAuth, requireFamily, async (req, res) => {
   }
 });
 
-// Delete
 // Delete (SYNC SAFE)
 router.delete("/:id", requireAuth, requireFamily, async (req, res) => {
   const { id } = req.params;
