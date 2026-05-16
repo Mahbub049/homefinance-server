@@ -31,16 +31,33 @@ const app = express();
 // middlewares
 const allowedOrigins = [
   process.env.CLIENT_URL,
+
+  // Web local development
   "http://localhost:5173",
   "http://localhost:3000",
+
+  // Capacitor Android / WebView origins
+  "http://localhost",
+  "https://localhost",
+  "capacitor://localhost",
+
+  // Add your deployed frontend URL here if not already in CLIENT_URL
+  "https://homefinance.vercel.app",
 ].filter(Boolean);
 
 app.use(
   cors({
     origin(origin, callback) {
-      if (!origin || allowedOrigins.includes(origin)) {
+      // Allow Postman, server-to-server, mobile/native requests without origin
+      if (!origin) {
         return callback(null, true);
       }
+
+      if (allowedOrigins.includes(origin)) {
+        return callback(null, true);
+      }
+
+      console.log("Blocked by CORS:", origin);
 
       return callback(new Error("Not allowed by CORS"));
     },
