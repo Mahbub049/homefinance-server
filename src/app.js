@@ -10,12 +10,12 @@ import paymentMethodRouter from "./routes/paymentMethod.route.js";
 import cardLabelRouter from "./routes/cardLabel.route.js";
 import ledgerRouter from "./routes/ledger.route.js";
 
-// ✅ NEW
 import accountRouter from "./routes/account.route.js";
 import transactionRouter from "./routes/transaction.route.js";
 
 import fixedRouter from "./routes/fixed.route.js";
 import groceryRouter from "./routes/grocery.route.js";
+import groceryShopRouter from "./routes/groceryShop.route.js";
 import emiRouter from "./routes/emi.route.js";
 import dashboardRouter from "./routes/dashboard.route.js";
 import exportRouter from "./routes/export.route.js";
@@ -47,6 +47,7 @@ app.use(
     credentials: true,
   })
 );
+
 app.use(express.json());
 app.use(morgan("dev"));
 
@@ -57,17 +58,13 @@ app.use("/api/family", familyRouter);
 app.use("/api/categories", categoryRouter);
 app.use("/api/payment-methods", paymentMethodRouter);
 app.use("/api/card-labels", cardLabelRouter);
-
-// ✅ NEW
 app.use("/api/accounts", accountRouter);
-
 app.use("/api/ledger", ledgerRouter);
-
-// ✅ NEW
 app.use("/api/transactions", transactionRouter);
 
 app.use("/api/fixed", fixedRouter);
 app.use("/api/grocery", groceryRouter);
+app.use("/api/grocery-shops", groceryShopRouter);
 app.use("/api/emi", emiRouter);
 app.use("/api/dashboard", dashboardRouter);
 app.use("/api/export", exportRouter);

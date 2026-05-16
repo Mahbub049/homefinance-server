@@ -9,7 +9,11 @@ const accountSchema = new mongoose.Schema(
       index: true,
     },
 
-    name: { type: String, required: true, trim: true },
+    name: {
+      type: String,
+      required: true,
+      trim: true,
+    },
 
     type: {
       type: String,
@@ -25,12 +29,24 @@ const accountSchema = new mongoose.Schema(
       required: true,
     },
 
-    openingBalance: { type: Number, default: 0 },
-    isActive: { type: Boolean, default: true },
+    openingBalance: {
+      type: Number,
+      default: 0,
+    },
+
+    isActive: {
+      type: Boolean,
+      default: true,
+    },
   },
   { timestamps: true }
 );
 
-accountSchema.index({ familyId: 1, name: 1 }, { unique: true });
+// Same owner cannot have same account name twice.
+// But Mahbub and Mirza can both have "EBL Account".
+accountSchema.index(
+  { familyId: 1, owner: 1, name: 1 },
+  { unique: true }
+);
 
 export default mongoose.model("Account", accountSchema);
