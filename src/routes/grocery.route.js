@@ -163,6 +163,23 @@ async function prepareGroceryPayload(req) {
     throw err;
   }
 
+  const splitSnapshot = { type: split.type };
+  if (split.type === "personal") {
+    splitSnapshot.personalUserId = split.personalUserId || null;
+  }
+  if (split.type === "ratio") {
+    splitSnapshot.ratios = (split.ratios || []).map((r) => ({
+      userId: r.userId,
+      ratio: Number(r.ratio || 0),
+    }));
+  }
+  if (split.type === "fixed") {
+    splitSnapshot.fixed = (split.fixed || []).map((f) => ({
+      userId: f.userId,
+      amount: round2(f.amount || 0),
+    }));
+  }
+
   const month = toMonthString(dateObj);
   const groceryNote = `Grocery: ${shopName || "Transaction"}`;
 
@@ -190,6 +207,7 @@ async function prepareGroceryPayload(req) {
       itemsSubtotal,
       totalPayable,
       note: String(note || "").trim(),
+      splitSnapshot,
       createdByUserId: req.user.userId,
     },
     transactionFields: {
@@ -260,10 +278,14 @@ router.get("/", requireAuth, requireFamily, async (req, res) => {
 
   res.json({
     ok: true,
-    items: txns.map((t) => ({
-      ...t.toObject(),
-      items: itemMap[String(t._id)] || [],
-    })),
+    items: txns.map((t) => {
+      const obj = t.toObject();
+      return {
+        ...obj,
+        split: obj.splitSnapshot || { type: "equal" },
+        items: itemMap[String(t._id)] || [],
+      };
+    }),
   });
 });
 

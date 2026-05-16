@@ -33,6 +33,12 @@ const groceryTxnSchema = new mongoose.Schema(
 
     note: { type: String, default: "" },
 
+    // Stores the selected split type/values so the Grocery page can display and edit it later.
+    splitSnapshot: {
+      type: mongoose.Schema.Types.Mixed,
+      default: null,
+    },
+
     // ✅ Link to ledger entry (for family split reporting etc.)
     ledgerEntryId: { type: mongoose.Schema.Types.ObjectId, ref: "LedgerEntry", required: true },
 
