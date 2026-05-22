@@ -48,6 +48,15 @@ function monthInRange(targetMonth, startMonth, endMonth) {
   return targetMonth >= startMonth && targetMonth <= endMonth;
 }
 
+function ownerFromMemberName(name) {
+  const n = String(name || "").trim().toLowerCase();
+
+  if (n.includes("mahbub")) return "Mahbub";
+  if (n.includes("mirza")) return "Mirza";
+
+  return "";
+}
+
 function diffMonthsInclusive(start, now, end) {
   let cur = now;
   if (cur < start) cur = start;
@@ -537,7 +546,7 @@ router.put("/installments/:id/status", requireAuth, requireFamily, async (req, r
       _id: fromAccountId,
       familyId: req.familyId,
       isActive: true,
-    }).select("_id name type");
+    }).select("_id name type owner");
 
     if (!account) {
       return res.status(400).json({ ok: false, message: "Selected account not found" });
@@ -547,6 +556,31 @@ router.put("/installments/:id/status", requireAuth, requireFamily, async (req, r
       return res.status(400).json({
         ok: false,
         message: "EMI payment must be made from a cash, bank, or wallet account",
+      });
+    }
+
+    const payerMember = await FamilyMember.findOne({
+      familyId: req.familyId,
+      userId: paidByUserId,
+    }).populate("userId", "name");
+
+    if (!payerMember) {
+      return res.status(400).json({
+        ok: false,
+        message: "Selected payer is not a valid family member",
+      });
+    }
+
+    const payerOwner = ownerFromMemberName(payerMember?.userId?.name);
+
+    if (
+      payerOwner &&
+      account.owner !== payerOwner &&
+      account.owner !== "Joint"
+    ) {
+      return res.status(400).json({
+        ok: false,
+        message: "Selected account does not belong to the selected payer",
       });
     }
 
