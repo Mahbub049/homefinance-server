@@ -7,6 +7,7 @@ import LedgerEntry from "../models/LedgerEntry.js";
 import Split from "../models/Split.js";
 import FamilyMember from "../models/FamilyMember.js";
 import Transaction from "../models/Transaction.js";
+import Settlement from "../models/Settlement.js";
 
 const router = Router();
 
@@ -18,6 +19,14 @@ function getId(v) {
   if (!v) return "";
   if (typeof v === "string") return v;
   return String(v._id || v.id || v);
+}
+
+function monthKey(dateInput) {
+  const d = new Date(dateInput);
+  if (Number.isNaN(d.getTime())) return null;
+  const y = d.getFullYear();
+  const m = String(d.getMonth() + 1).padStart(2, "0");
+  return `${y}-${m}`;
 }
 
 function buildOwnerToUserId(members = []) {
@@ -115,6 +124,123 @@ async function calculateTransferEffects({ familyId, month, members }) {
   }
 
   return effectMap;
+}
+
+function normalizeSettlement(doc) {
+  const plain = typeof doc.toObject === "function" ? doc.toObject() : doc;
+
+  return {
+    _id: plain._id,
+    month: plain.month,
+    date: plain.date,
+    fromUserId: plain.fromUserId,
+    toUserId: plain.toUserId,
+    fromAccountId: plain.fromAccountId,
+    toAccountId: plain.toAccountId,
+    amount: round2(plain.amount || 0),
+    settlementType: plain.settlementType,
+    status: plain.status,
+    note: plain.note || "",
+    transactionId: plain.transactionId || null,
+    affectsWallet: !!plain.affectsWallet,
+    affectsLedger: !!plain.affectsLedger,
+    affectsMonthlySettlement: !!plain.affectsMonthlySettlement,
+    createdAt: plain.createdAt,
+    updatedAt: plain.updatedAt,
+  };
+}
+
+function buildSettlementInfo({ resultUsers, settlements }) {
+  const byUser = new Map();
+
+  for (const u of resultUsers) {
+    byUser.set(String(u.userId), {
+      userId: u.userId,
+      name: u.name,
+      net: round2(u.net || 0),
+      shouldPay: u.net < 0 ? round2(Math.abs(u.net)) : 0,
+      shouldReceive: u.net > 0 ? round2(u.net) : 0,
+      settledPaid: 0,
+      settledReceived: 0,
+      pastMarkedPaid: 0,
+      pastMarkedReceived: 0,
+      pendingPay: u.net < 0 ? round2(Math.abs(u.net)) : 0,
+      pendingReceive: u.net > 0 ? round2(u.net) : 0,
+      status: u.net === 0 ? "settled" : "pending",
+    });
+  }
+
+  for (const s of settlements) {
+    if (s.status !== "settled") continue;
+
+    const amount = round2(s.amount || 0);
+    const fromId = getId(s.fromUserId);
+    const toId = getId(s.toUserId);
+
+    if (s.affectsMonthlySettlement) {
+      if (byUser.has(fromId)) {
+        byUser.get(fromId).settledPaid = round2(byUser.get(fromId).settledPaid + amount);
+      }
+      if (byUser.has(toId)) {
+        byUser.get(toId).settledReceived = round2(byUser.get(toId).settledReceived + amount);
+      }
+    } else if (s.settlementType === "past_pending") {
+      if (byUser.has(fromId)) {
+        byUser.get(fromId).pastMarkedPaid = round2(byUser.get(fromId).pastMarkedPaid + amount);
+      }
+      if (byUser.has(toId)) {
+        byUser.get(toId).pastMarkedReceived = round2(byUser.get(toId).pastMarkedReceived + amount);
+      }
+    }
+  }
+
+  const summary = Array.from(byUser.values()).map((row) => {
+    const pendingPay = round2(Math.max(0, Number(row.shouldPay || 0) - Number(row.settledPaid || 0)));
+    const pendingReceive = round2(Math.max(0, Number(row.shouldReceive || 0) - Number(row.settledReceived || 0)));
+
+    return {
+      ...row,
+      pendingPay,
+      pendingReceive,
+      status: pendingPay <= 0.009 && pendingReceive <= 0.009 ? "settled" : "pending",
+    };
+  });
+
+  const requiredTotal = round2(summary.reduce((sum, row) => sum + Number(row.shouldPay || 0), 0));
+  const monthlySettled = round2(summary.reduce((sum, row) => sum + Number(row.settledPaid || 0), 0));
+  const pendingTotal = round2(summary.reduce((sum, row) => sum + Number(row.pendingPay || 0), 0));
+  const pastPendingSettled = round2(
+    settlements
+      .filter((s) => s.status === "settled" && s.settlementType === "past_pending")
+      .reduce((sum, s) => sum + Number(s.amount || 0), 0)
+  );
+
+  let settlement = null;
+
+  if (resultUsers.length === 2) {
+    const payer = summary.find((row) => row.shouldPay > 0);
+    const receiver = summary.find((row) => row.shouldReceive > 0);
+    const amount = round2(Math.min(payer?.pendingPay || 0, receiver?.pendingReceive || 0));
+
+    if (payer && receiver && amount > 0.009) {
+      settlement = {
+        fromUserId: payer.userId,
+        toUserId: receiver.userId,
+        amount,
+      };
+    }
+  }
+
+  return {
+    settlement,
+    settlementSummary: summary,
+    settlementTotals: {
+      requiredTotal,
+      monthlySettled,
+      pendingTotal,
+      pastPendingSettled,
+    },
+  };
 }
 
 // GET /api/wallet/summary?month=YYYY-MM
@@ -243,33 +369,28 @@ router.get("/summary", requireAuth, requireFamily, async (req, res) => {
     }
 
     // -----------------------------
-    // 6) Settlement suggestion for expense sharing only
+    // 6) Settlement records + pending suggestion
     // -----------------------------
-    let settlement = null;
+    const settlements = (
+      await Settlement.find({ familyId: req.familyId, month })
+        .sort({ date: -1, createdAt: -1 })
+        .populate("fromUserId", "name email")
+        .populate("toUserId", "name email")
+        .populate("fromAccountId", "name owner type")
+        .populate("toAccountId", "name owner type")
+        .lean()
+    ).map(normalizeSettlement);
 
-    if (resultUsers.length === 2) {
-      const [u1, u2] = resultUsers;
-
-      if (u1.net > 0 && u2.net < 0) {
-        settlement = {
-          fromUserId: u2.userId,
-          toUserId: u1.userId,
-          amount: Math.abs(u2.net),
-        };
-      } else if (u2.net > 0 && u1.net < 0) {
-        settlement = {
-          fromUserId: u1.userId,
-          toUserId: u2.userId,
-          amount: Math.abs(u1.net),
-        };
-      }
-    }
+    const settlementInfo = buildSettlementInfo({ resultUsers, settlements });
 
     res.json({
       ok: true,
       month,
       users: resultUsers,
-      settlement,
+      settlement: settlementInfo.settlement,
+      settlementSummary: settlementInfo.settlementSummary,
+      settlementTotals: settlementInfo.settlementTotals,
+      settlements,
       transferLogic: {
         sameOwner: "ignored",
         crossOwner: "from owner decreases, to owner increases",
@@ -279,6 +400,150 @@ router.get("/summary", requireAuth, requireFamily, async (req, res) => {
   } catch (err) {
     console.error("Wallet Error:", err);
     res.status(500).json({ ok: false, message: "Server error" });
+  }
+});
+
+// POST /api/wallet/settlements
+// body for wallet settlement:
+// { settlementType:"wallet", date, fromUserId, toUserId, amount, fromAccountId, toAccountId, note }
+// body for past pending mark:
+// { settlementType:"past_pending", date, fromUserId, toUserId, amount, note }
+router.post("/settlements", requireAuth, requireFamily, async (req, res) => {
+  try {
+    const {
+      settlementType = "wallet",
+      date,
+      fromUserId,
+      toUserId,
+      amount,
+      fromAccountId,
+      toAccountId,
+      note,
+    } = req.body || {};
+
+    if (!["wallet", "past_pending"].includes(settlementType)) {
+      return res.status(400).json({ ok: false, message: "Invalid settlement type" });
+    }
+
+    const amt = Number(amount || 0);
+    if (!amt || amt <= 0) {
+      return res.status(400).json({ ok: false, message: "Amount must be > 0" });
+    }
+
+    const dt = date ? new Date(date) : new Date();
+    if (Number.isNaN(dt.getTime())) {
+      return res.status(400).json({ ok: false, message: "Invalid date" });
+    }
+
+    const month = monthKey(dt);
+
+    if (!fromUserId || !toUserId) {
+      return res.status(400).json({ ok: false, message: "From and To member are required" });
+    }
+
+    if (String(fromUserId) === String(toUserId)) {
+      return res.status(400).json({ ok: false, message: "From and To member must be different" });
+    }
+
+    const members = await FamilyMember.find({ familyId: req.familyId }).select("userId").lean();
+    const memberIds = members.map((m) => String(m.userId));
+
+    if (!memberIds.includes(String(fromUserId)) || !memberIds.includes(String(toUserId))) {
+      return res.status(400).json({ ok: false, message: "Invalid family member selected" });
+    }
+
+    let transaction = null;
+
+    if (settlementType === "wallet") {
+      if (!fromAccountId || !toAccountId) {
+        return res.status(400).json({ ok: false, message: "From and To accounts are required" });
+      }
+
+      if (String(fromAccountId) === String(toAccountId)) {
+        return res.status(400).json({ ok: false, message: "From and To accounts must be different" });
+      }
+
+      const accounts = await Account.find({
+        _id: { $in: [fromAccountId, toAccountId] },
+        familyId: req.familyId,
+      }).lean();
+
+      if (accounts.length !== 2) {
+        return res.status(400).json({ ok: false, message: "Invalid account selected" });
+      }
+
+      transaction = await Transaction.create({
+        familyId: req.familyId,
+        txType: "transfer",
+        date: dt,
+        month,
+        categoryId: null,
+        amount: amt,
+        note: `[Settlement] ${(note || "Monthly settlement").trim()}`,
+        fromAccountId,
+        toAccountId,
+        paidByUserId: null,
+        receivedByUserId: null,
+        createdByUserId: req.user.userId,
+      });
+    }
+
+    const item = await Settlement.create({
+      familyId: req.familyId,
+      month,
+      date: dt,
+      fromUserId,
+      toUserId,
+      amount: amt,
+      settlementType,
+      status: "settled",
+      fromAccountId: settlementType === "wallet" ? fromAccountId : null,
+      toAccountId: settlementType === "wallet" ? toAccountId : null,
+      transactionId: transaction?._id || null,
+      affectsWallet: settlementType === "wallet",
+      affectsLedger: settlementType === "wallet",
+      affectsMonthlySettlement: settlementType === "wallet",
+      note: (note || "").trim(),
+      createdByUserId: req.user.userId,
+    });
+
+    res.status(201).json({ ok: true, item, transactionId: transaction?._id || null });
+  } catch (err) {
+    console.error("Create settlement error:", err);
+    res.status(500).json({ ok: false, message: err?.message || "Create settlement failed" });
+  }
+});
+
+// DELETE /api/wallet/settlements/:id
+// If the settlement created a transfer transaction, this also removes that transfer.
+router.delete("/settlements/:id", requireAuth, requireFamily, async (req, res) => {
+  try {
+    const item = await Settlement.findOne({ _id: req.params.id, familyId: req.familyId });
+    if (!item) return res.status(404).json({ ok: false, message: "Settlement not found" });
+
+    let removedTransaction = false;
+
+    if (item.transactionId) {
+      const ledgerEntries = await LedgerEntry.find({
+        familyId: req.familyId,
+        sourceId: item.transactionId,
+      }).select("_id");
+
+      for (const le of ledgerEntries) {
+        await Split.deleteMany({ familyId: req.familyId, ledgerEntryId: le._id });
+        await LedgerEntry.deleteOne({ _id: le._id, familyId: req.familyId });
+      }
+
+      const txDelete = await Transaction.deleteOne({ _id: item.transactionId, familyId: req.familyId });
+      removedTransaction = txDelete.deletedCount > 0;
+    }
+
+    await Settlement.deleteOne({ _id: item._id, familyId: req.familyId });
+
+    res.json({ ok: true, removedTransaction });
+  } catch (err) {
+    console.error("Delete settlement error:", err);
+    res.status(500).json({ ok: false, message: err?.message || "Delete settlement failed" });
   }
 });
 
