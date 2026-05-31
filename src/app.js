@@ -26,6 +26,7 @@ import monthBalanceRouter from "./routes/monthBalance.route.js";
 import yearOverviewRouter from "./routes/yearOverview.route.js";
 import plannedPurchaseRouter from "./routes/plannedPurchase.route.js";
 import individualSummaryRouter from "./routes/individualSummary.route.js";
+import taxCenterRouter from "./routes/taxCenter.route.js";
 
 const app = express();
 
@@ -93,6 +94,7 @@ app.use("/api/month-balance", monthBalanceRouter);
 app.use("/api/year-overview", yearOverviewRouter);
 app.use("/api/planned-purchases", plannedPurchaseRouter);
 app.use("/api/individual-summary", individualSummaryRouter);
+app.use("/api/tax-center", taxCenterRouter);
 
 // default route
 app.get("/", (req, res) => {

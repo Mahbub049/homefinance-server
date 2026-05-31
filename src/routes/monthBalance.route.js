@@ -124,17 +124,40 @@ async function balancesAtDateRaw(familyIdString, asOfDate) {
     { $group: { _id: "$toAccountId", total: { $sum: "$amount" } } },
   ]);
 
-  const outflows = await Transaction.aggregate([
+  const normalOutflows = await Transaction.aggregate([
     {
       $match: {
         familyId: familyObjectId,
         date: { $lt: cutoff },
         fromAccountId: { $ne: null },
-        txType: { $in: ["expense", "transfer"] },
+        $or: [
+          { txType: "transfer" },
+          { txType: "expense", paymentMode: { $ne: "split" } },
+        ],
       },
     },
     { $group: { _id: "$fromAccountId", total: { $sum: "$amount" } } },
   ]);
+
+  const splitPaymentOutflows = await Transaction.aggregate([
+    {
+      $match: {
+        familyId: familyObjectId,
+        date: { $lt: cutoff },
+        txType: "expense",
+        paymentMode: "split",
+      },
+    },
+    { $unwind: "$paymentParts" },
+    {
+      $group: {
+        _id: "$paymentParts.accountId",
+        total: { $sum: "$paymentParts.amount" },
+      },
+    },
+  ]);
+
+  const outflows = [...normalOutflows, ...splitPaymentOutflows];
 
   const inMap = Object.create(null);
   const outMap = Object.create(null);
@@ -144,7 +167,8 @@ async function balancesAtDateRaw(familyIdString, asOfDate) {
   }
 
   for (const r of outflows) {
-    outMap[String(r._id)] = Number(r.total || 0);
+    const id = String(r._id);
+    outMap[id] = Number(outMap[id] || 0) + Number(r.total || 0);
   }
 
   let total = 0;
@@ -186,17 +210,40 @@ async function accountMovementsForMonth(familyIdString, month) {
     { $group: { _id: "$toAccountId", total: { $sum: "$amount" } } },
   ]);
 
-  const outflows = await Transaction.aggregate([
+  const normalOutflows = await Transaction.aggregate([
     {
       $match: {
         familyId: familyObjectId,
         month,
         fromAccountId: { $ne: null },
-        txType: { $in: ["expense", "transfer"] },
+        $or: [
+          { txType: "transfer" },
+          { txType: "expense", paymentMode: { $ne: "split" } },
+        ],
       },
     },
     { $group: { _id: "$fromAccountId", total: { $sum: "$amount" } } },
   ]);
+
+  const splitPaymentOutflows = await Transaction.aggregate([
+    {
+      $match: {
+        familyId: familyObjectId,
+        month,
+        txType: "expense",
+        paymentMode: "split",
+      },
+    },
+    { $unwind: "$paymentParts" },
+    {
+      $group: {
+        _id: "$paymentParts.accountId",
+        total: { $sum: "$paymentParts.amount" },
+      },
+    },
+  ]);
+
+  const outflows = [...normalOutflows, ...splitPaymentOutflows];
 
   const map = Object.create(null);
 

@@ -280,20 +280,40 @@ router.get("/summary", requireAuth, requireFamily, async (req, res) => {
 
     // -----------------------------
     // 2) Expense paid per user
+    //    Single payment: count the transaction amount for the selected payer.
+    //    Split payment: count each payment part for the member who actually paid it.
     // -----------------------------
-    const expenseEntries = await LedgerEntry.find({
-      familyId: req.familyId,
-      entryType: "expense",
-      month,
-    });
+    const [expenseEntries, expenseTransactions] = await Promise.all([
+      LedgerEntry.find({
+        familyId: req.familyId,
+        entryType: "expense",
+        month,
+      }),
+      Transaction.find({
+        familyId: req.familyId,
+        txType: "expense",
+        month,
+      }).select("amount paidByUserId paymentMode paymentParts"),
+    ]);
 
     const paidMap = {};
     for (const uid of userIdStrings) paidMap[uid] = 0;
 
-    for (const entry of expenseEntries) {
-      const uid = getId(entry.paidByUserId);
-      if (uid && paidMap[uid] !== undefined) {
-        paidMap[uid] = round2(paidMap[uid] + Number(entry.amountTotal || 0));
+    for (const tx of expenseTransactions) {
+      const parts = Array.isArray(tx.paymentParts) ? tx.paymentParts : [];
+
+      if (tx.paymentMode === "split" && parts.length > 0) {
+        for (const part of parts) {
+          const uid = getId(part.userId);
+          if (uid && paidMap[uid] !== undefined) {
+            paidMap[uid] = round2(paidMap[uid] + Number(part.amount || 0));
+          }
+        }
+      } else {
+        const uid = getId(tx.paidByUserId);
+        if (uid && paidMap[uid] !== undefined) {
+          paidMap[uid] = round2(paidMap[uid] + Number(tx.amount || 0));
+        }
       }
     }
 

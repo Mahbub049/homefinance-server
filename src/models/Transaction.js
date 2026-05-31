@@ -53,6 +53,22 @@ const transactionSchema = new mongoose.Schema(
       default: null,
     },
 
+    // Expense payment source.
+    // single = one member paid the whole amount from one account.
+    // split = multiple members paid partial amounts from their own accounts.
+    paymentMode: {
+      type: String,
+      enum: ["single", "split"],
+      default: "single",
+    },
+    paymentParts: [
+      {
+        userId: { type: mongoose.Schema.Types.ObjectId, ref: "User", required: true },
+        accountId: { type: mongoose.Schema.Types.ObjectId, ref: "Account", required: true },
+        amount: { type: Number, required: true },
+      },
+    ],
+
     // Only for expense transactions.
     // This preserves how the expense should be shared in Ledger/Wallet summaries.
     split: {

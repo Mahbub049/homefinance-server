@@ -8,6 +8,7 @@ import Category from "../models/Category.js";
 import LedgerEntry from "../models/LedgerEntry.js";
 import Split from "../models/Split.js";
 import FamilyMember from "../models/FamilyMember.js";
+import Account from "../models/Account.js";
 
 import { splitEqual, splitPersonal, splitRatio, splitFixed } from "../utils/splitCalc.js";
 
@@ -23,6 +24,163 @@ function cleanId(value) {
   if (!value) return null;
   if (typeof value === "object") return value._id || value.id || null;
   return value;
+}
+
+function round2(n) {
+  return Math.round((Number(n || 0) + Number.EPSILON) * 100) / 100;
+}
+
+function accountOwnerMatchesMember(account, memberUserId, memberNameByUserId) {
+  const owner = String(account?.owner || "").trim().toLowerCase();
+
+  if (!owner) return true;
+  if (["joint", "shared", "family"].includes(owner)) return true;
+
+  const memberName = String(memberNameByUserId.get(String(memberUserId)) || "")
+    .trim()
+    .toLowerCase();
+
+  if (!memberName) return true;
+
+  const memberParts = memberName.split(/\s+/).filter(Boolean);
+
+  return (
+    memberName.includes(owner) ||
+    owner.includes(memberName) ||
+    memberParts.some((part) => owner.includes(part) || part.includes(owner))
+  );
+}
+
+async function buildExpensePayments({ familyId, amount, paidByUserId, fromAccountId, paymentMode, paymentParts }) {
+  const mode = paymentMode === "split" ? "split" : "single";
+
+  const members = await FamilyMember.find({ familyId })
+    .populate("userId", "name")
+    .lean();
+
+  const validUserIds = members.map((m) => String(cleanId(m.userId))).filter(Boolean);
+  const memberNameByUserId = new Map(
+    members.map((m) => [String(cleanId(m.userId)), String(m.userId?.name || "")])
+  );
+
+  const accountIds = mode === "split"
+    ? (Array.isArray(paymentParts) ? paymentParts.map((p) => cleanId(p.accountId)).filter(Boolean) : [])
+    : [fromAccountId].filter(Boolean);
+
+  const accounts = await Account.find({
+    familyId,
+    _id: { $in: accountIds },
+    isActive: { $ne: false },
+  }).lean();
+
+  const accountById = new Map(accounts.map((a) => [String(a._id), a]));
+
+  if (mode === "single") {
+    if (!paidByUserId) {
+      const err = new Error("Paid By required for expense");
+      err.status = 400;
+      throw err;
+    }
+
+    if (!fromAccountId) {
+      const err = new Error("From account required for expense");
+      err.status = 400;
+      throw err;
+    }
+
+    if (!validUserIds.includes(String(paidByUserId))) {
+      const err = new Error("Invalid Paid By member");
+      err.status = 400;
+      throw err;
+    }
+
+    const account = accountById.get(String(fromAccountId));
+    if (!account) {
+      const err = new Error("Selected account not found");
+      err.status = 400;
+      throw err;
+    }
+
+    if (!["cash", "bank", "wallet"].includes(String(account.type || "").toLowerCase())) {
+      const err = new Error("Expense payment must be made from a cash, bank, or wallet account");
+      err.status = 400;
+      throw err;
+    }
+
+    if (!accountOwnerMatchesMember(account, paidByUserId, memberNameByUserId)) {
+      const err = new Error("Selected account does not belong to the selected payer");
+      err.status = 400;
+      throw err;
+    }
+
+    return {
+      paymentMode: "single",
+      paidByUserId,
+      fromAccountId,
+      paymentParts: [{ userId: paidByUserId, accountId: fromAccountId, amount: round2(amount) }],
+    };
+  }
+
+  const rows = Array.isArray(paymentParts)
+    ? paymentParts.map((p) => ({
+        userId: cleanId(p.userId),
+        accountId: cleanId(p.accountId),
+        amount: Number(p.amount || 0),
+      }))
+    : [];
+
+  if (rows.length < 2) {
+    const err = new Error("Split payment needs at least two payment rows");
+    err.status = 400;
+    throw err;
+  }
+
+  for (const row of rows) {
+    if (!row.userId || !validUserIds.includes(String(row.userId))) {
+      const err = new Error("Invalid member in split payment");
+      err.status = 400;
+      throw err;
+    }
+
+    if (!row.accountId || !accountById.has(String(row.accountId))) {
+      const err = new Error("Select a valid account for every split payment row");
+      err.status = 400;
+      throw err;
+    }
+
+    if (!row.amount || row.amount <= 0) {
+      const err = new Error("Every split payment amount must be greater than 0");
+      err.status = 400;
+      throw err;
+    }
+
+    const account = accountById.get(String(row.accountId));
+    if (!["cash", "bank", "wallet"].includes(String(account.type || "").toLowerCase())) {
+      const err = new Error("Split payment accounts must be cash, bank, or wallet accounts");
+      err.status = 400;
+      throw err;
+    }
+
+    if (!accountOwnerMatchesMember(account, row.userId, memberNameByUserId)) {
+      const err = new Error("One selected account does not belong to the selected payer");
+      err.status = 400;
+      throw err;
+    }
+  }
+
+  const totalPaid = round2(rows.reduce((sum, row) => sum + Number(row.amount || 0), 0));
+  if (totalPaid !== round2(amount)) {
+    const err = new Error("Split payment amounts must sum to the total transaction amount");
+    err.status = 400;
+    throw err;
+  }
+
+  return {
+    paymentMode: "split",
+    paidByUserId: null,
+    fromAccountId: null,
+    paymentParts: rows.map((row) => ({ ...row, amount: round2(row.amount) })),
+  };
 }
 
 async function resolveFinancialType({ familyId, txType, categoryId }) {
@@ -257,6 +415,8 @@ async function validateTransactionInput(req, body = {}) {
     toAccountId,
     paidByUserId,
     receivedByUserId,
+    paymentMode,
+    paymentParts,
     split,
   } = body;
 
@@ -280,8 +440,6 @@ async function validateTransactionInput(req, body = {}) {
 
   if (txType === "expense") {
     if (!categoryId) return { ok: false, message: "Category required for expense" };
-    if (!fromAccountId) return { ok: false, message: "From account required for expense" };
-    if (!paidByUserId) return { ok: false, message: "Paid By required for expense" };
   }
 
   if (txType === "transfer") {
@@ -295,19 +453,36 @@ async function validateTransactionInput(req, body = {}) {
 
   let normalizedSplit = null;
   let splitRows = [];
+  let normalizedPayment = {
+    paymentMode: txType === "expense" ? "single" : undefined,
+    paidByUserId: txType === "expense" ? paidByUserId || null : null,
+    fromAccountId: txType === "expense" ? fromAccountId || null : null,
+    paymentParts: [],
+  };
 
   if (txType === "expense") {
     try {
-      const result = await buildExpenseSplit({
+      normalizedPayment = await buildExpensePayments({
         familyId: req.familyId,
         amount: amt,
         paidByUserId,
+        fromAccountId,
+        paymentMode,
+        paymentParts,
+      });
+
+      const splitFallbackPayer = normalizedPayment.paidByUserId || normalizedPayment.paymentParts?.[0]?.userId || null;
+
+      const result = await buildExpenseSplit({
+        familyId: req.familyId,
+        amount: amt,
+        paidByUserId: splitFallbackPayer,
         split,
       });
       normalizedSplit = result.normalizedSplit;
       splitRows = result.splitRows;
     } catch (e) {
-      return { ok: false, message: e?.message || "Invalid split data" };
+      return { ok: false, message: e?.message || "Invalid split/payment data" };
     }
   }
 
@@ -320,10 +495,16 @@ async function validateTransactionInput(req, body = {}) {
       categoryId: txType === "transfer" ? null : categoryId,
       amount: amt,
       note: (note || "").trim(),
-      fromAccountId: txType === "income" ? null : fromAccountId || null,
+      fromAccountId: txType === "expense"
+        ? normalizedPayment.fromAccountId
+        : txType === "income"
+          ? null
+          : fromAccountId || null,
       toAccountId: txType === "expense" ? null : toAccountId || null,
-      paidByUserId: txType === "expense" ? paidByUserId || null : null,
+      paidByUserId: txType === "expense" ? normalizedPayment.paidByUserId : null,
       receivedByUserId: txType === "income" ? receivedByUserId || null : null,
+      paymentMode: txType === "expense" ? normalizedPayment.paymentMode : "single",
+      paymentParts: txType === "expense" ? normalizedPayment.paymentParts : [],
       split: txType === "expense" ? normalizedSplit : null,
       splitRows,
     },
@@ -349,6 +530,8 @@ router.get("/", requireAuth, requireFamily, async (req, res) => {
     .populate("toAccountId")
     .populate("paidByUserId")
     .populate("receivedByUserId")
+    .populate("paymentParts.userId", "name")
+    .populate("paymentParts.accountId", "name type owner")
     .populate("split.personalUserId", "name")
     .populate("split.ratios.userId", "name")
     .populate("split.fixed.userId", "name");
@@ -397,6 +580,8 @@ router.post("/", requireAuth, requireFamily, async (req, res) => {
       toAccountId: payload.toAccountId,
       paidByUserId: payload.paidByUserId,
       receivedByUserId: payload.receivedByUserId,
+      paymentMode: payload.paymentMode,
+      paymentParts: payload.paymentParts,
       split: payload.split,
       createdByUserId: req.user.userId,
     });
@@ -431,6 +616,8 @@ router.put("/:id", requireAuth, requireFamily, async (req, res) => {
     existing.toAccountId = payload.toAccountId;
     existing.paidByUserId = payload.paidByUserId;
     existing.receivedByUserId = payload.receivedByUserId;
+    existing.paymentMode = payload.paymentMode;
+    existing.paymentParts = payload.paymentParts;
     existing.split = payload.split;
     await existing.save();
 
