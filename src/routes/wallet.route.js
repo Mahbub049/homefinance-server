@@ -366,12 +366,15 @@ router.get("/summary", requireAuth, requireFamily, async (req, res) => {
       // positive = paid more than share; negative = paid less than share.
       const net = round2(paid - share);
 
-      // Personal remaining includes owner-aware transfers:
-      // same-owner transfer = 0 effect; cross-owner transfer changes balance.
-      const remaining = round2(income - share + transferNet);
+      // Share-based remaining is useful for settlement understanding:
+      // income - personal expense share + transfer net.
+      const shareBasedRemaining = round2(income - share + transferNet);
 
-      // Cash-style view: income minus actual paid amount plus transfer net.
+      // Actual wallet/cash remaining:
+      // income - actually paid expense + transfer net.
+      // This is what the Wallet page should show as Remaining Balance.
       const cashAfterPaid = round2(income - paid + transferNet);
+      const remaining = cashAfterPaid;
 
       resultUsers.push({
         userId: uid,
@@ -385,6 +388,7 @@ router.get("/summary", requireAuth, requireFamily, async (req, res) => {
         net,
         remaining,
         cashAfterPaid,
+        shareBasedRemaining,
       });
     }
 
