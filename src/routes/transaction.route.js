@@ -545,7 +545,13 @@ router.get("/summary", requireAuth, requireFamily, async (req, res) => {
   if (!month) return res.status(400).json({ ok: false, message: "month is required" });
 
   const rows = await Transaction.aggregate([
-    { $match: { familyId: new mongoose.Types.ObjectId(req.familyId), month } },
+    {
+      $match: {
+        familyId: new mongoose.Types.ObjectId(req.familyId),
+        month,
+        budgetImpact: { $ne: false },
+      },
+    },
     { $group: { _id: "$txType", total: { $sum: "$amount" } } },
   ]);
 
@@ -601,6 +607,13 @@ router.put("/:id", requireAuth, requireFamily, async (req, res) => {
     const existing = await Transaction.findOne({ _id: id, familyId: req.familyId });
     if (!existing) return res.status(404).json({ ok: false, message: "Not found" });
 
+    if (String(existing.sourceType || "").startsWith("shared_purchase")) {
+      return res.status(400).json({
+        ok: false,
+        message: "Manage this transaction from Shared Purchases.",
+      });
+    }
+
     const check = await validateTransactionInput(req, req.body || {});
     if (!check.ok) return res.status(400).json({ ok: false, message: check.message });
 
@@ -634,8 +647,15 @@ router.delete("/:id", requireAuth, requireFamily, async (req, res) => {
   const { id } = req.params;
 
   // 1) find transaction first
-  const tx = await Transaction.findOne({ _id: id, familyId: req.familyId }).select("_id");
+  const tx = await Transaction.findOne({ _id: id, familyId: req.familyId }).select("_id sourceType");
   if (!tx) return res.status(404).json({ ok: false, message: "Not found" });
+
+  if (String(tx.sourceType || "").startsWith("shared_purchase")) {
+    return res.status(400).json({
+      ok: false,
+      message: "Manage this transaction from Shared Purchases.",
+    });
+  }
 
   // 2) delete ALL ledger entries that point to this tx (even if sourceType is empty/wrong)
   const ledgerEntries = await LedgerEntry.find({

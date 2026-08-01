@@ -76,6 +76,7 @@ router.get("/", requireAuth, requireFamily, async (req, res) => {
         $match: {
           familyId: familyObjectId,
           month: { $gte: startMonth, $lte: endMonth },
+          budgetImpact: { $ne: false },
         },
       },
       {

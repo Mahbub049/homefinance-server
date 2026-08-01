@@ -29,6 +29,21 @@ const transactionSchema = new mongoose.Schema(
     amount: { type: Number, required: true },
     note: { type: String, default: "" },
 
+    // Controls how a real money movement appears in reports.
+    // false = affects account balance, but is excluded from regular monthly income/expense totals.
+    budgetImpact: { type: Boolean, default: true, index: true },
+
+    // Prevents /api/ledger/rebuild from converting special account-only movements
+    // into normal monthly ledger expenses.
+    ledgerEligible: { type: Boolean, default: true, index: true },
+
+    // Prevents special managed purchases from changing the normal monthly
+    // member-settlement calculation in Wallet.
+    settlementImpact: { type: Boolean, default: true, index: true },
+
+    sourceType: { type: String, default: "", index: true },
+    sourceId: { type: mongoose.Schema.Types.ObjectId, default: null, index: true },
+
     // Accounts
     fromAccountId: {
       type: mongoose.Schema.Types.ObjectId,

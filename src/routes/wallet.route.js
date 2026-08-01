@@ -288,11 +288,13 @@ router.get("/summary", requireAuth, requireFamily, async (req, res) => {
         familyId: req.familyId,
         entryType: "expense",
         month,
+        affectsSettlement: { $ne: false },
       }),
       Transaction.find({
         familyId: req.familyId,
         txType: "expense",
         month,
+        settlementImpact: { $ne: false },
       }).select("amount paidByUserId paymentMode paymentParts"),
     ]);
 

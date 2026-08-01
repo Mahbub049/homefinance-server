@@ -22,6 +22,11 @@ const ledgerEntrySchema = new mongoose.Schema(
 
     amountTotal: { type: Number, required: true }, // total amount of this entry
 
+    // false = shown in monthly budgets/reports, but excluded from the ordinary
+    // "who paid vs who owes" Wallet settlement engine because it has its own
+    // reimbursement schedule.
+    affectsSettlement: { type: Boolean, default: true, index: true },
+
     // for expenses (who paid)
     paidByUserId: { type: mongoose.Schema.Types.ObjectId, ref: "User", default: null },
 

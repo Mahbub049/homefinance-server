@@ -74,7 +74,13 @@ async function txSummaryForMonth(familyIdString, month) {
   const familyObjectId = new mongoose.Types.ObjectId(familyIdString);
 
   const rows = await Transaction.aggregate([
-    { $match: { familyId: familyObjectId, month } },
+    {
+      $match: {
+        familyId: familyObjectId,
+        month,
+        budgetImpact: { $ne: false },
+      },
+    },
     { $group: { _id: "$txType", total: { $sum: "$amount" } } },
   ]);
 

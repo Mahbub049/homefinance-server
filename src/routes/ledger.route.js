@@ -121,6 +121,13 @@ router.delete("/:id", requireAuth, requireFamily, async (req, res) => {
   const entry = await LedgerEntry.findOne({ _id: req.params.id, familyId: req.familyId });
   if (!entry) return res.status(404).json({ ok: false, message: "Not found" });
 
+  if (String(entry.sourceType || "") === "shared_purchase_installment") {
+    return res.status(400).json({
+      ok: false,
+      message: "Manage this allocation from Shared Purchases.",
+    });
+  }
+
   // ✅ If this ledger entry was created from a transaction, delete that transaction too
   if (String(entry.sourceType || "") === "transaction" && entry.sourceId) {
     await Transaction.deleteOne({ _id: entry.sourceId, familyId: req.familyId });
@@ -152,7 +159,12 @@ router.post("/rebuild", requireAuth, requireFamily, async (req, res) => {
     let recreatedGroceryLedgerLinks = 0;
 
     // 1) Income/Expense Transactions → ensure LedgerEntry + personal split exists
-    const txs = await Transaction.find({ familyId, month, txType: { $in: ["income", "expense"] } }).lean();
+    const txs = await Transaction.find({
+      familyId,
+      month,
+      txType: { $in: ["income", "expense"] },
+      ledgerEligible: { $ne: false },
+    }).lean();
     for (const t of txs) {
       // IMPORTANT:
       // Some modules (fixed/grocery) create a Transaction + LedgerEntry.

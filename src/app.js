@@ -27,6 +27,7 @@ import yearOverviewRouter from "./routes/yearOverview.route.js";
 import plannedPurchaseRouter from "./routes/plannedPurchase.route.js";
 import individualSummaryRouter from "./routes/individualSummary.route.js";
 import taxCenterRouter from "./routes/taxCenter.route.js";
+import sharedPurchaseRouter from "./routes/sharedPurchase.route.js";
 
 const app = express();
 
@@ -95,6 +96,7 @@ app.use("/api/year-overview", yearOverviewRouter);
 app.use("/api/planned-purchases", plannedPurchaseRouter);
 app.use("/api/individual-summary", individualSummaryRouter);
 app.use("/api/tax-center", taxCenterRouter);
+app.use("/api/shared-purchases", sharedPurchaseRouter);
 
 // default route
 app.get("/", (req, res) => {
