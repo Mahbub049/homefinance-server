@@ -8,6 +8,7 @@ import Split from "../models/Split.js";
 import FamilyMember from "../models/FamilyMember.js";
 import Transaction from "../models/Transaction.js";
 import Settlement from "../models/Settlement.js";
+import { cleanupPendingInstallmentLedgers } from "../utils/installmentLedger.js";
 
 const router = Router();
 
@@ -250,6 +251,8 @@ router.get("/summary", requireAuth, requireFamily, async (req, res) => {
     if (!month) {
       return res.status(400).json({ ok: false, message: "month required" });
     }
+
+    await cleanupPendingInstallmentLedgers(req.familyId, month);
 
     const members = await FamilyMember.find({ familyId: req.familyId }).populate(
       "userId",
@@ -508,8 +511,15 @@ router.post("/settlements", requireAuth, requireFamily, async (req, res) => {
         note: `[Settlement] ${(note || "Monthly settlement").trim()}`,
         fromAccountId,
         toAccountId,
-        paidByUserId: null,
-        receivedByUserId: null,
+        paidByUserId: fromUserId,
+        receivedByUserId: toUserId,
+        paymentMode: "single",
+        paymentParts: [],
+        budgetImpact: false,
+        ledgerEligible: false,
+        settlementImpact: false,
+        sourceType: "wallet_settlement",
+        sourceId: null,
         createdByUserId: req.user.userId,
       });
     }

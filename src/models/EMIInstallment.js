@@ -14,8 +14,12 @@ const emiInstallmentSchema = new mongoose.Schema(
     // paid = money moved (creates a Transaction)
     status: { type: String, enum: ["pending", "paid"], default: "pending" },
 
-    // split-aware ledger entry (used by wallet/summary)
-    ledgerEntryId: { type: mongoose.Schema.Types.ObjectId, ref: "LedgerEntry", required: true },
+    // Expense category is stored on the schedule so no budget/ledger entry is
+    // needed until the installment is actually paid.
+    categoryId: { type: mongoose.Schema.Types.ObjectId, ref: "Category", default: null },
+
+    // Created only after payment. Pending installments are schedules, not spend.
+    ledgerEntryId: { type: mongoose.Schema.Types.ObjectId, ref: "LedgerEntry", default: null },
 
     // who paid (used when status=paid)
     paidByUserId: { type: mongoose.Schema.Types.ObjectId, ref: "User", default: null },

@@ -11,6 +11,7 @@ import GroceryTransaction from "../models/GroceryTransaction.js";
 import FixedInstance from "../models/FixedInstance.js";
 import EMIInstallment from "../models/EMIInstallment.js";
 import { splitEqual, splitPersonal, splitRatio, splitFixed } from "../utils/splitCalc.js";
+import { cleanupPendingInstallmentLedgers } from "../utils/installmentLedger.js";
 
 const router = Router();
 
@@ -21,6 +22,8 @@ const router = Router();
 router.get("/", requireAuth, requireFamily, async (req, res) => {
   const { month } = req.query;
   if (!month) return res.status(400).json({ ok: false, message: "month is required" });
+
+  await cleanupPendingInstallmentLedgers(req.familyId, month);
 
   const entries = await LedgerEntry.find({ familyId: req.familyId, month })
     .sort({ date: -1, createdAt: -1 })

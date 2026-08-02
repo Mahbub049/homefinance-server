@@ -8,6 +8,7 @@ import Split from "../models/Split.js";
 import FamilyMember from "../models/FamilyMember.js";
 import Account from "../models/Account.js";
 import Transaction from "../models/Transaction.js";
+import { cleanupPendingInstallmentLedgers } from "../utils/installmentLedger.js";
 
 const router = Router();
 
@@ -111,6 +112,8 @@ router.get("/summary", requireAuth, requireFamily, async (req, res) => {
       return res.status(400).json({ ok: false, message: "month required" });
     }
 
+    await cleanupPendingInstallmentLedgers(req.familyId, month);
+
     /* ===========================================
        1️⃣ LOAD FAMILY USERS
     =========================================== */
@@ -207,8 +210,9 @@ router.get("/summary", requireAuth, requireFamily, async (req, res) => {
     }
 
     for (const e of entries) {
-      // Settlement applies to EXPENSE entries only
-      if (e.entryType !== "expense") continue;
+      // Settlement applies only to ordinary expense-sharing entries. Managed
+      // EMI/shared-purchase plans settle through their own payment flows.
+      if (e.entryType !== "expense" || e.affectsSettlement === false) continue;
 
       const entrySplits = splitByEntry[String(e._id)] || [];
 
@@ -278,6 +282,8 @@ router.get("/summary", requireAuth, requireFamily, async (req, res) => {
 
 router.get("/trend", requireAuth, requireFamily, async (req, res) => {
   try {
+    await cleanupPendingInstallmentLedgers(req.familyId);
+
     const now = new Date();
     const months = [];
 

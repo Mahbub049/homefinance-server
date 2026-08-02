@@ -11,6 +11,7 @@ import Category from "../models/Category.js";
 import Transaction from "../models/Transaction.js";
 import LedgerEntry from "../models/LedgerEntry.js";
 import Split from "../models/Split.js";
+import { cleanupPendingInstallmentLedgers } from "../utils/installmentLedger.js";
 
 const router = Router();
 
@@ -126,9 +127,81 @@ function plainUserId(value) {
   return String(value);
 }
 
+async function upsertSharedInstallmentLedger({
+  familyId,
+  purchase,
+  installment,
+  categoryId,
+  date,
+  createdByUserId,
+  linkInstallment = true,
+}) {
+  const entryDate = new Date(date);
+  const entryMonth = monthKey(entryDate);
+  let entry = null;
+
+  if (installment.ledgerEntryId) {
+    entry = await LedgerEntry.findOne({
+      _id: installment.ledgerEntryId,
+      familyId,
+    });
+  }
+
+  if (!entry) {
+    entry = await LedgerEntry.findOne({
+      familyId,
+      sourceType: "shared_purchase_installment",
+      sourceId: installment._id,
+    });
+  }
+
+  const values = {
+    entryType: "expense",
+    financialType: "debt",
+    module: "shared_purchase",
+    date: entryDate,
+    month: entryMonth,
+    categoryId,
+    amountTotal: Number(installment.amount || 0),
+    affectsSettlement: false,
+    paidByUserId: installment.userId,
+    receivedByUserId: null,
+    note: `${String(purchase.title || "Purchase").trim()} · monthly allocation`,
+    sourceType: "shared_purchase_installment",
+    sourceId: installment._id,
+  };
+
+  if (!entry) {
+    entry = await LedgerEntry.create({
+      familyId,
+      ...values,
+      createdByUserId,
+    });
+  } else {
+    Object.assign(entry, values);
+    await entry.save();
+  }
+
+  await Split.deleteMany({ familyId, ledgerEntryId: entry._id });
+  await Split.create({
+    familyId,
+    ledgerEntryId: entry._id,
+    userId: installment.userId,
+    shareAmount: Number(installment.amount || 0),
+  });
+
+  if (linkInstallment) {
+    installment.ledgerEntryId = entry._id;
+    await installment.save();
+  }
+  return entry;
+}
+
 router.get("/", requireAuth, requireFamily, async (req, res) => {
   try {
     const month = validMonth(req.query.month) ? String(req.query.month) : monthKey(new Date());
+
+    await cleanupPendingInstallmentLedgers(req.familyId, month);
 
     const plans = await SharedPurchase.find({ familyId: req.familyId })
       .sort({ createdAt: -1 })
@@ -410,34 +483,20 @@ router.post("/", requireAuth, requireFamily, async (req, res) => {
         });
         createdInstallmentIds.push(installment._id);
 
-        const ledgerEntry = await LedgerEntry.create({
-          familyId: req.familyId,
-          entryType: "expense",
-          financialType: "debt",
-          module: "shared_purchase",
-          date: dueDate,
-          month,
-          categoryId: category._id,
-          amountTotal: scheduledAmounts[index],
-          affectsSettlement: false,
-          paidByUserId: share.userId,
-          receivedByUserId: null,
-          note: `${String(title).trim()} · monthly allocation`,
-          sourceType: "shared_purchase_installment",
-          sourceId: installment._id,
-          createdByUserId: req.user.userId,
-        });
-        createdLedgerIds.push(ledgerEntry._id);
-
-        await Split.create({
-          familyId: req.familyId,
-          ledgerEntryId: ledgerEntry._id,
-          userId: share.userId,
-          shareAmount: scheduledAmounts[index],
-        });
-
-        installment.ledgerEntryId = ledgerEntry._id;
-        await installment.save();
+        // The upfront payer's own share is a monthly budget allocation.
+        // Other members' scheduled repayments do not affect debt/spend until
+        // Record Payment is clicked.
+        if (!paymentRequired) {
+          const ledgerEntry = await upsertSharedInstallmentLedger({
+            familyId: req.familyId,
+            purchase,
+            installment,
+            categoryId: category._id,
+            date: dueDate,
+            createdByUserId: req.user.userId,
+          });
+          createdLedgerIds.push(ledgerEntry._id);
+        }
       }
     }
 
@@ -477,9 +536,13 @@ router.post(
   requireAuth,
   requireFamily,
   async (req, res) => {
+    let paymentTransaction = null;
+    let paymentLedger = null;
+    let installment = null;
+
     try {
       const { fromAccountId, toAccountId, paidDate, note } = req.body || {};
-      const installment = await SharedPurchaseInstallment.findOne({
+      installment = await SharedPurchaseInstallment.findOne({
         _id: req.params.installmentId,
         purchaseId: req.params.purchaseId,
         familyId: req.familyId,
@@ -520,7 +583,7 @@ router.post(
         return res.status(400).json({ ok: false, message: "Invalid payment date" });
       }
 
-      const transaction = await Transaction.create({
+      paymentTransaction = await Transaction.create({
         familyId: req.familyId,
         txType: "transfer",
         date,
@@ -542,16 +605,56 @@ router.post(
         createdByUserId: req.user.userId,
       });
 
+      // Only a recorded reimbursement becomes monthly debt/spend. The account
+      // transfer itself remains excluded from income/expense totals.
+      paymentLedger = await upsertSharedInstallmentLedger({
+        familyId: req.familyId,
+        purchase,
+        installment,
+        categoryId: purchase.categoryId,
+        date,
+        createdByUserId: req.user.userId,
+        linkInstallment: false,
+      });
+
       installment.status = "paid";
-      installment.paymentTransactionId = transaction._id;
+      installment.ledgerEntryId = paymentLedger._id;
+      installment.paymentTransactionId = paymentTransaction._id;
       installment.fromAccountId = fromAccountId;
       installment.toAccountId = toAccountId;
       installment.paidAt = date;
       await installment.save();
 
       const status = await refreshPurchaseStatus(purchase._id, req.familyId);
-      res.json({ ok: true, status, transactionId: transaction._id });
+      res.json({ ok: true, status, transactionId: paymentTransaction._id });
     } catch (error) {
+      try {
+        if (paymentLedger?._id) {
+          await Split.deleteMany({ familyId: req.familyId, ledgerEntryId: paymentLedger._id });
+          await LedgerEntry.deleteOne({ _id: paymentLedger._id, familyId: req.familyId });
+        }
+        if (paymentTransaction?._id) {
+          await Transaction.deleteOne({ _id: paymentTransaction._id, familyId: req.familyId });
+        }
+        if (installment?._id) {
+          await SharedPurchaseInstallment.updateOne(
+            { _id: installment._id, familyId: req.familyId },
+            {
+              $set: {
+                status: "pending",
+                ledgerEntryId: null,
+                paymentTransactionId: null,
+                fromAccountId: null,
+                toAccountId: null,
+                paidAt: null,
+              },
+            }
+          );
+        }
+      } catch (rollbackError) {
+        console.error("Shared purchase payment rollback error:", rollbackError);
+      }
+
       console.error("Pay shared purchase installment error:", error);
       res.status(500).json({ ok: false, message: error?.message || "Payment failed" });
     }
@@ -583,8 +686,20 @@ router.delete(
         });
       }
 
+      if (installment.ledgerEntryId) {
+        await Split.deleteMany({
+          familyId: req.familyId,
+          ledgerEntryId: installment.ledgerEntryId,
+        });
+        await LedgerEntry.deleteOne({
+          _id: installment.ledgerEntryId,
+          familyId: req.familyId,
+        });
+      }
+
       installment.status = "pending";
       installment.paymentTransactionId = null;
+      installment.ledgerEntryId = null;
       installment.fromAccountId = null;
       installment.toAccountId = null;
       installment.paidAt = null;
