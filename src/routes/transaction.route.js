@@ -11,6 +11,7 @@ import FamilyMember from "../models/FamilyMember.js";
 import Account from "../models/Account.js";
 
 import { splitEqual, splitPersonal, splitRatio, splitFixed } from "../utils/splitCalc.js";
+import { cleanupPendingInstallmentLedgers } from "../utils/installmentLedger.js";
 
 function monthKey(dateInput) {
   const d = new Date(dateInput);
@@ -539,29 +540,43 @@ router.get("/", requireAuth, requireFamily, async (req, res) => {
   res.json({ ok: true, items });
 });
 
-// Summary totals by type
+// Summary totals for the monthly Ledger view.
+// Income/expense are Ledger-based monthly responsibility; transfers are actual
+// account movements. This keeps managed EMI/shared-purchase payments consistent
+// without treating reimbursements as income or double-counting the original purchase.
 router.get("/summary", requireAuth, requireFamily, async (req, res) => {
   const { month } = req.query;
   if (!month) return res.status(400).json({ ok: false, message: "month is required" });
 
-  const rows = await Transaction.aggregate([
-    {
-      $match: {
-        familyId: new mongoose.Types.ObjectId(req.familyId),
-        month,
-        budgetImpact: { $ne: false },
-      },
-    },
-    { $group: { _id: "$txType", total: { $sum: "$amount" } } },
+  await cleanupPendingInstallmentLedgers(req.familyId, month);
+
+  const familyObjectId = new mongoose.Types.ObjectId(req.familyId);
+  const [ledgerRows, transferRows] = await Promise.all([
+    LedgerEntry.aggregate([
+      { $match: { familyId: familyObjectId, month } },
+      { $group: { _id: "$entryType", total: { $sum: "$amountTotal" } } },
+    ]),
+    Transaction.aggregate([
+      { $match: { familyId: familyObjectId, month, txType: "transfer" } },
+      { $group: { _id: null, total: { $sum: "$amount" } } },
+    ]),
   ]);
 
-  const out = { income: 0, expense: 0, transfer: 0 };
-  for (const r of rows) {
-    if (r._id === "income") out.income = r.total;
-    if (r._id === "expense") out.expense = r.total;
-    if (r._id === "transfer") out.transfer = r.total;
+  const out = {
+    income: 0,
+    expense: 0,
+    transfer: Number(transferRows?.[0]?.total || 0),
+  };
+
+  for (const row of ledgerRows) {
+    if (row._id === "income") out.income = Number(row.total || 0);
+    if (row._id === "expense") out.expense = Number(row.total || 0);
   }
-  out.netCashflow = out.income - out.expense;
+
+  out.income = round2(out.income);
+  out.expense = round2(out.expense);
+  out.transfer = round2(out.transfer);
+  out.netCashflow = round2(out.income - out.expense);
 
   res.json({ ok: true, totals: out });
 });

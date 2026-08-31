@@ -6,6 +6,8 @@ import { requireFamily } from "../middlewares/familyGuard.js";
 import MonthlyBalance from "../models/MonthlyBalance.js";
 import Account from "../models/Account.js";
 import Transaction from "../models/Transaction.js";
+import LedgerEntry from "../models/LedgerEntry.js";
+import { cleanupPendingInstallmentLedgers } from "../utils/installmentLedger.js";
 
 const router = Router();
 
@@ -70,30 +72,44 @@ function cleanSnapshotRow(row, fallback = {}) {
   };
 }
 
-async function txSummaryForMonth(familyIdString, month) {
+async function financialSummaryForMonth(familyIdString, month) {
   const familyObjectId = new mongoose.Types.ObjectId(familyIdString);
 
-  const rows = await Transaction.aggregate([
+  // Monthly income/expense responsibility comes from LedgerEntry. This includes
+  // managed EMI/shared-purchase allocations only after they become real monthly
+  // budget entries, while the underlying account movements remain Transaction-based.
+  const ledgerRows = await LedgerEntry.aggregate([
     {
       $match: {
         familyId: familyObjectId,
         month,
-        budgetImpact: { $ne: false },
       },
     },
-    { $group: { _id: "$txType", total: { $sum: "$amount" } } },
+    { $group: { _id: "$entryType", total: { $sum: "$amountTotal" } } },
+  ]);
+
+  // Transfers are real account movements, so include every transfer even when it
+  // intentionally has budgetImpact=false (for example managed reimbursements).
+  const transferRows = await Transaction.aggregate([
+    {
+      $match: {
+        familyId: familyObjectId,
+        month,
+        txType: "transfer",
+      },
+    },
+    { $group: { _id: null, total: { $sum: "$amount" } } },
   ]);
 
   const out = {
     income: 0,
     expense: 0,
-    transfer: 0,
+    transfer: Number(transferRows?.[0]?.total || 0),
   };
 
-  for (const r of rows) {
-    if (r._id === "income") out.income = Number(r.total || 0);
-    if (r._id === "expense") out.expense = Number(r.total || 0);
-    if (r._id === "transfer") out.transfer = Number(r.total || 0);
+  for (const row of ledgerRows) {
+    if (row._id === "income") out.income = Number(row.total || 0);
+    if (row._id === "expense") out.expense = Number(row.total || 0);
   }
 
   out.netCashflow = out.income - out.expense;
@@ -395,7 +411,8 @@ router.get("/", requireAuth, requireFamily, async (req, res) => {
       openingSnap.accounts,
       movements
     );
-    const summary = await txSummaryForMonth(req.familyId, month);
+    await cleanupPendingInstallmentLedgers(req.familyId, month);
+    const summary = await financialSummaryForMonth(req.familyId, month);
 
     let doc = await MonthlyBalance.findOne({
       familyId: familyObjectId,
@@ -493,7 +510,8 @@ router.post("/close", requireAuth, requireFamily, async (req, res) => {
       req.body?.accountBalances || []
     );
 
-    const summary = await txSummaryForMonth(req.familyId, month);
+    await cleanupPendingInstallmentLedgers(req.familyId, month);
+    const summary = await financialSummaryForMonth(req.familyId, month);
 
     doc.openingBalance = openingSnap.total;
     doc.closingBalance = manual.total;

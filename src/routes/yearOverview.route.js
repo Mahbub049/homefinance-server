@@ -5,6 +5,8 @@ import { requireFamily } from "../middlewares/familyGuard.js";
 
 import Account from "../models/Account.js";
 import Transaction from "../models/Transaction.js";
+import LedgerEntry from "../models/LedgerEntry.js";
+import { cleanupPendingInstallmentLedgers } from "../utils/installmentLedger.js";
 
 const router = Router();
 
@@ -70,29 +72,51 @@ router.get("/", requireAuth, requireFamily, async (req, res) => {
 
     const familyObjectId = new mongoose.Types.ObjectId(req.familyId);
 
-    // ✅ NEW ENGINE: Aggregate Transactions by month & txType
-    const txRows = await Transaction.aggregate([
+    // Keep legacy pending EMI/shared-purchase schedules out of yearly budget totals.
+    await cleanupPendingInstallmentLedgers(req.familyId);
+
+    // Monthly income/expense comes from LedgerEntry, which is the source of truth
+    // for financial responsibility and planned monthly spending.
+    const ledgerRows = await LedgerEntry.aggregate([
       {
         $match: {
           familyId: familyObjectId,
           month: { $gte: startMonth, $lte: endMonth },
-          budgetImpact: { $ne: false },
         },
       },
       {
         $group: {
-          _id: { month: "$month", txType: "$txType" },
-          total: { $sum: "$amount" },
+          _id: { month: "$month", entryType: "$entryType" },
+          total: { $sum: "$amountTotal" },
         },
       },
     ]);
 
-    const txMap = {};
-    for (const r of txRows) {
-      const m = r._id.month;
-      const t = r._id.txType;
-      if (!txMap[m]) txMap[m] = {};
-      txMap[m][t] = Number(r.total || 0);
+    const ledgerMap = {};
+    for (const row of ledgerRows) {
+      const month = row._id.month;
+      const entryType = row._id.entryType;
+      if (!ledgerMap[month]) ledgerMap[month] = {};
+      ledgerMap[month][entryType] = Number(row.total || 0);
+    }
+
+    // Transfers are real account movements. Include managed reimbursements even
+    // when budgetImpact=false; they must not become income/expense, but they are
+    // still genuine transfers between accounts.
+    const transferRows = await Transaction.aggregate([
+      {
+        $match: {
+          familyId: familyObjectId,
+          month: { $gte: startMonth, $lte: endMonth },
+          txType: "transfer",
+        },
+      },
+      { $group: { _id: "$month", total: { $sum: "$amount" } } },
+    ]);
+
+    const transferMap = Object.create(null);
+    for (const row of transferRows) {
+      transferMap[String(row._id)] = Number(row.total || 0);
     }
 
     // Savings growth = transfers into savings - transfers out of savings
@@ -165,9 +189,9 @@ router.get("/", requireAuth, requireFamily, async (req, res) => {
         cashAccountIds
       );
 
-      const income = round2(txMap[m]?.income || 0);
-      const expense = round2(txMap[m]?.expense || 0);
-      const transfer = round2(txMap[m]?.transfer || 0);
+      const income = round2(ledgerMap[m]?.income || 0);
+      const expense = round2(ledgerMap[m]?.expense || 0);
+      const transfer = round2(transferMap[m] || 0);
       const netCashflow = round2(income - expense);
 
       const savingsIn = round2(savingsInMap[m] || 0);

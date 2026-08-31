@@ -101,6 +101,42 @@ async function validateMemberIds(familyId, ids) {
   return ids.every((id) => allowed.has(String(id)));
 }
 
+async function memberNameMap(familyId, userIds = []) {
+  const ids = [...new Set((userIds || []).map((id) => String(id || "")).filter(Boolean))];
+  if (!ids.length) return new Map();
+
+  const members = await FamilyMember.find({
+    familyId,
+    userId: { $in: ids },
+  })
+    .populate("userId", "name")
+    .lean();
+
+  return new Map(
+    members.map((member) => [
+      String(member.userId?._id || member.userId || ""),
+      String(member.userId?.name || ""),
+    ])
+  );
+}
+
+function accountOwnerMatchesMember(account, memberUserId, namesByUserId) {
+  const owner = String(account?.owner || "").trim().toLowerCase();
+  if (!owner || ["joint", "shared", "family"].includes(owner)) return true;
+
+  const memberName = String(namesByUserId.get(String(memberUserId)) || "")
+    .trim()
+    .toLowerCase();
+  if (!memberName) return false;
+
+  const memberParts = memberName.split(/\s+/).filter(Boolean);
+  return (
+    memberName.includes(owner) ||
+    owner.includes(memberName) ||
+    memberParts.some((part) => owner.includes(part) || part.includes(owner))
+  );
+}
+
 async function refreshPurchaseStatus(purchaseId, familyId) {
   const [paymentCount, pending] = await Promise.all([
     SharedPurchaseInstallment.countDocuments({
@@ -398,6 +434,14 @@ router.post("/", requireAuth, requireFamily, async (req, res) => {
       return res.status(400).json({ ok: false, message: "One or more selected members are invalid" });
     }
 
+    const payerNames = await memberNameMap(req.familyId, [payerUserId]);
+    if (!accountOwnerMatchesMember(account, payerUserId, payerNames)) {
+      return res.status(400).json({
+        ok: false,
+        message: "The selected upfront payment account does not belong to the payer",
+      });
+    }
+
     const shareTotal = round2(
       normalizedShares.reduce((sum, row) => sum + Number(row.shareAmount || 0), 0)
     );
@@ -576,6 +620,28 @@ router.post(
       }).lean();
       if (accounts.length !== 2) {
         return res.status(400).json({ ok: false, message: "Invalid account selected" });
+      }
+
+      const accountById = new Map(accounts.map((account) => [String(account._id), account]));
+      const fromAccount = accountById.get(String(fromAccountId));
+      const toAccount = accountById.get(String(toAccountId));
+      const namesByUserId = await memberNameMap(req.familyId, [
+        installment.userId,
+        purchase.payerUserId,
+      ]);
+
+      if (!accountOwnerMatchesMember(fromAccount, installment.userId, namesByUserId)) {
+        return res.status(400).json({
+          ok: false,
+          message: "Pay from account must belong to the member making this reimbursement",
+        });
+      }
+
+      if (!accountOwnerMatchesMember(toAccount, purchase.payerUserId, namesByUserId)) {
+        return res.status(400).json({
+          ok: false,
+          message: "Receiving account must belong to the original upfront payer",
+        });
       }
 
       const date = paidDate ? new Date(paidDate) : new Date();
