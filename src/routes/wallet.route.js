@@ -149,12 +149,16 @@ async function calculateSharedPurchaseEffects({ familyId, month, memberIds }) {
     month,
     paymentRequired: true,
   })
-    .select("purchaseId userId amount status paidAt paymentTransactionId")
+    .select(
+      "purchaseId userId amount status paidAt paymentTransactionId fromAccountId toAccountId"
+    )
     .lean();
 
   if (!installments.length) return effectMap;
 
-  const purchaseIds = [...new Set(installments.map((row) => getId(row.purchaseId)).filter(Boolean))];
+  const purchaseIds = [
+    ...new Set(installments.map((row) => getId(row.purchaseId)).filter(Boolean)),
+  ];
   const purchases = await SharedPurchase.find({
     familyId,
     _id: { $in: purchaseIds },
@@ -162,7 +166,38 @@ async function calculateSharedPurchaseEffects({ familyId, month, memberIds }) {
     .select("_id payerUserId title")
     .lean();
 
-  const purchaseById = new Map(purchases.map((row) => [String(row._id), row]));
+  const purchaseById = new Map(
+    purchases.map((row) => [String(row._id), row])
+  );
+
+  // A Shared/Large Purchase installment is considered paid only when both the
+  // installment and its real reimbursement transaction agree. This prevents a
+  // stale/partial record from incorrectly cancelling a current obligation.
+  const paymentTransactionIds = installments
+    .filter(
+      (row) =>
+        row.status === "paid" &&
+        row.paidAt &&
+        row.paymentTransactionId
+    )
+    .map((row) => row.paymentTransactionId);
+
+  const paymentTransactions = paymentTransactionIds.length
+    ? await Transaction.find({
+        familyId,
+        _id: { $in: paymentTransactionIds },
+        txType: "transfer",
+        sourceType: "shared_purchase_reimbursement",
+      })
+        .select(
+          "_id sourceId amount paidByUserId receivedByUserId fromAccountId toAccountId"
+        )
+        .lean()
+    : [];
+
+  const paymentTransactionById = new Map(
+    paymentTransactions.map((row) => [String(row._id), row])
+  );
 
   for (const installment of installments) {
     const debtorId = getId(installment.userId);
@@ -174,46 +209,98 @@ async function calculateSharedPurchaseEffects({ familyId, month, memberIds }) {
     if (!effectMap[debtorId] || !effectMap[receiverId]) continue;
     if (debtorId === receiverId) continue;
 
-    // The scheduled reimbursement is an interpersonal obligation:
-    // debtor owes the original upfront payer.
-    effectMap[debtorId].sharedPurchaseDue = round2(
-      effectMap[debtorId].sharedPurchaseDue + amount
-    );
-    effectMap[receiverId].sharedPurchaseReceivable = round2(
-      effectMap[receiverId].sharedPurchaseReceivable + amount
+    const paymentTx = installment.paymentTransactionId
+      ? paymentTransactionById.get(getId(installment.paymentTransactionId))
+      : null;
+
+    const verifiedPaid = Boolean(
+      installment.status === "paid" &&
+        installment.paidAt &&
+        paymentTx &&
+        getId(paymentTx.sourceId) === getId(installment._id) &&
+        getId(paymentTx.paidByUserId) === debtorId &&
+        getId(paymentTx.receivedByUserId) === receiverId &&
+        Math.abs(round2(paymentTx.amount || 0) - amount) <= 0.009
     );
 
-    // A recorded Shared & Large Purchase payment settles that obligation.
-    // Keep the obligation and payment as separate components so the Wallet
-    // can show both parts instead of silently cancelling them.
-    if (installment.status === "paid") {
+    if (verifiedPaid) {
+      // The reimbursement has already happened, so the shared-purchase debt is
+      // no longer part of the CURRENT settlement. Keep these fields only for
+      // information/history; do not add the payment again to final net.
       effectMap[debtorId].sharedPurchasePaid = round2(
         effectMap[debtorId].sharedPurchasePaid + amount
       );
       effectMap[receiverId].sharedPurchaseReceived = round2(
         effectMap[receiverId].sharedPurchaseReceived + amount
       );
+      continue;
     }
+
+    // Only unpaid/unverified installments belong in the current settlement.
+    effectMap[debtorId].sharedPurchaseDue = round2(
+      effectMap[debtorId].sharedPurchaseDue + amount
+    );
+    effectMap[receiverId].sharedPurchaseReceivable = round2(
+      effectMap[receiverId].sharedPurchaseReceivable + amount
+    );
   }
 
   for (const userId of Object.keys(effectMap)) {
     const row = effectMap[userId];
+
+    // Current outstanding Shared/Large Purchase position only.
     row.sharedPurchaseObligationNet = round2(
       row.sharedPurchaseReceivable - row.sharedPurchaseDue
     );
 
-    // Paying a reimbursement improves the payer's settlement position;
-    // receiving it reduces the receiver's outstanding claim.
-    row.sharedPurchasePaymentNet = round2(
-      row.sharedPurchasePaid - row.sharedPurchaseReceived
-    );
-
-    row.sharedPurchaseNet = round2(
-      row.sharedPurchaseObligationNet + row.sharedPurchasePaymentNet
-    );
+    // Kept for backwards-compatible API/UI fields. A verified reimbursement
+    // clears the obligation instead of being added as a second adjustment.
+    row.sharedPurchasePaymentNet = 0;
+    row.sharedPurchaseNet = row.sharedPurchaseObligationNet;
   }
 
   return effectMap;
+}
+
+async function getVerifiedWalletSettlements({ familyId, settlements }) {
+  const candidates = settlements.filter(
+    (row) =>
+      row.status === "settled" &&
+      row.settlementType === "wallet" &&
+      row.affectsMonthlySettlement &&
+      row.transactionId
+  );
+
+  if (!candidates.length) return [];
+
+  const transactionIds = candidates.map((row) => row.transactionId);
+  const transactions = await Transaction.find({
+    familyId,
+    _id: { $in: transactionIds },
+    txType: "transfer",
+    sourceType: "wallet_settlement",
+  })
+    .select(
+      "_id amount paidByUserId receivedByUserId fromAccountId toAccountId"
+    )
+    .lean();
+
+  const transactionById = new Map(
+    transactions.map((row) => [String(row._id), row])
+  );
+
+  return candidates.filter((settlement) => {
+    const tx = transactionById.get(getId(settlement.transactionId));
+    if (!tx) return false;
+
+    return (
+      getId(tx.paidByUserId) === getId(settlement.fromUserId) &&
+      getId(tx.receivedByUserId) === getId(settlement.toUserId) &&
+      getId(tx.fromAccountId) === getId(settlement.fromAccountId) &&
+      getId(tx.toAccountId) === getId(settlement.toAccountId) &&
+      Math.abs(round2(tx.amount || 0) - round2(settlement.amount || 0)) <= 0.009
+    );
+  });
 }
 
 function buildWalletSettlementEffects({ memberIds, settlements }) {
@@ -343,7 +430,11 @@ function buildSettlementInfo({ resultUsers, settlements }) {
   const walletSettled = round2(
     summary.reduce((sum, row) => sum + Number(row.walletSettlementPaid || 0), 0)
   );
-  const monthlySettled = round2(sharedPurchaseSettled + walletSettled);
+  // Shared reimbursements are NOT added as settlement adjustments here.
+  // Once verified, they simply remove that Shared/Large Purchase installment
+  // from the current outstanding obligation. Only Wallet Settlement payments
+  // reduce the already-combined current settlement position.
+  const monthlySettled = walletSettled;
   const pendingTotal = round2(
     summary.reduce((sum, row) => sum + Number(row.pendingPay || 0), 0)
   );
@@ -505,9 +596,13 @@ router.get("/summary", requireAuth, requireFamily, async (req, res) => {
     ]);
 
     const settlements = rawSettlements.map(normalizeSettlement);
+    const verifiedWalletSettlements = await getVerifiedWalletSettlements({
+      familyId: req.familyId,
+      settlements,
+    });
     const walletSettlementMap = buildWalletSettlementEffects({
       memberIds: userIdStrings,
-      settlements,
+      settlements: verifiedWalletSettlements,
     });
 
     // -----------------------------
@@ -558,18 +653,16 @@ router.get("/summary", requireAuth, requireFamily, async (req, res) => {
         walletSettlementMap[uid]?.walletSettlementNet || 0
       );
 
-      // Gross interpersonal position before any reimbursement/settlement payment.
-      // This combines normal expense sharing with the selected month's
-      // Shared & Large Purchase obligations.
+      // Current interpersonal position BEFORE Wallet Settlement payments.
+      // Shared/Large Purchase installments contribute only while they are
+      // unpaid. A verified Record Payment clears that installment instead of
+      // being added again as a second settlement adjustment.
       const preSettlementNet = round2(expenseNet + sharedPurchaseObligationNet);
 
-      // Shared purchase Record Payment and Wallet Settlement both reduce the
-      // member-to-member obligation in the direction money was actually paid.
-      // Keeping them as signed adjustments also handles an overpayment by
-      // correctly flipping the final payer/receiver direction.
-      const net = round2(
-        preSettlementNet + sharedPurchasePaymentNet + walletSettlementNet
-      );
+      // Only verified Wallet Settlement transfers reduce the already-combined
+      // current position. Shared purchase repayments are already reflected by
+      // the absence of their installment from sharedPurchaseObligationNet.
+      const net = round2(preSettlementNet + walletSettlementNet);
 
       // Share-based remaining is for normal monthly expense-share context.
       const shareBasedRemaining = round2(income - share + transferNet);
