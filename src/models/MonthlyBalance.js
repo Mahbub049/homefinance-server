@@ -60,6 +60,17 @@ const monthlyBalanceSchema = new mongoose.Schema(
       default: false,
     },
 
+    draftSavedAt: {
+      type: Date,
+      default: null,
+    },
+
+    draftSavedByUserId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "User",
+      default: null,
+    },
+
     closedAt: {
       type: Date,
       default: null,

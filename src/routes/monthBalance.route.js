@@ -286,6 +286,8 @@ async function accountMovementsForMonth(familyIdString, month) {
 
 async function openingSnapshotForMonth(familyIdString, month) {
   const familyObjectId = new mongoose.Types.ObjectId(familyIdString);
+  const bounds = monthBounds(month);
+  const raw = await balancesAtDateRaw(familyIdString, bounds.start);
   const previousMonth = prevMonth(month);
 
   if (previousMonth) {
@@ -296,9 +298,24 @@ async function openingSnapshotForMonth(familyIdString, month) {
     }).lean();
 
     if (previousDoc?.accountsClosing?.length) {
-      const accounts = previousDoc.accountsClosing.map((row) =>
-        cleanSnapshotRow(row)
+      const previousMap = new Map(
+        previousDoc.accountsClosing.map((row) => [
+          String(row.accountId),
+          cleanSnapshotRow(row),
+        ])
       );
+
+      // Always start from the currently active account/wallet list.
+      // Existing accounts inherit the previous closed balance; newly created
+      // accounts are automatically included using their calculated balance.
+      const accounts = raw.accounts.map((current) => {
+        const previous = previousMap.get(String(current.accountId));
+
+        return cleanSnapshotRow({
+          ...current,
+          balance: previous ? previous.balance : current.balance,
+        });
+      });
 
       return {
         accounts,
@@ -307,9 +324,6 @@ async function openingSnapshotForMonth(familyIdString, month) {
       };
     }
   }
-
-  const bounds = monthBounds(month);
-  const raw = await balancesAtDateRaw(familyIdString, bounds.start);
 
   return {
     ...raw,
@@ -433,18 +447,34 @@ router.get("/", requireAuth, requireFamily, async (req, res) => {
       await doc.save();
     }
 
-    const savedOpening = doc.accountsOpening?.length
-      ? doc.accountsOpening.map((row) => cleanSnapshotRow(row))
-      : openingSnap.accounts;
+    const isClosed =
+      doc.closingBalance !== null && doc.closingBalance !== undefined;
 
-    const savedClosing = doc.accountsClosing?.length
+    const savedOpening =
+      isClosed && doc.accountsOpening?.length
+        ? doc.accountsOpening.map((row) => cleanSnapshotRow(row))
+        : openingSnap.accounts;
+
+    // While the month is still open, recalculate from the latest active
+    // account/wallet list so newly created accounts appear automatically.
+    // Any balances the user manually adjusted and saved as a draft are kept.
+    const savedManualRows = (doc.accountsClosing || [])
+      .filter((row) => row.manualEdited)
+      .map((row) => ({
+        accountId: row.accountId,
+        balance: row.balance,
+      }));
+
+    const savedClosing = isClosed
       ? doc.accountsClosing.map((row) => cleanSnapshotRow(row))
-      : systemClosingSnap.accounts;
+      : applyManualClosingBalances(
+          systemClosingSnap.accounts,
+          savedManualRows
+        ).accounts;
 
-    const displayClosingTotal =
-      doc.closingBalance !== null && doc.closingBalance !== undefined
-        ? round2(doc.closingBalance)
-        : snapshotTotal(savedClosing);
+    const displayClosingTotal = isClosed
+      ? round2(doc.closingBalance)
+      : snapshotTotal(savedClosing);
 
     res.json({
       ok: true,
@@ -465,6 +495,100 @@ router.get("/", requireAuth, requireFamily, async (req, res) => {
     res.status(500).json({
       ok: false,
       message: error?.message || "Failed to load carry forward data",
+    });
+  }
+});
+
+// POST /api/month-balance/save
+// body: { month: "YYYY-MM", accountBalances: [{ accountId, balance }] }
+// Saves the current account-wise balances as a draft WITHOUT closing the month.
+router.post("/save", requireAuth, requireFamily, async (req, res) => {
+  try {
+    const month = String(req.body?.month || "").trim();
+
+    if (!parseMonth(month)) {
+      return res.status(400).json({
+        ok: false,
+        message: "Valid month (YYYY-MM) required",
+      });
+    }
+
+    const familyObjectId = new mongoose.Types.ObjectId(req.familyId);
+
+    let doc = await MonthlyBalance.findOne({
+      familyId: familyObjectId,
+      month,
+    });
+
+    if (
+      doc &&
+      doc.closingBalance !== null &&
+      doc.closingBalance !== undefined
+    ) {
+      return res.status(409).json({
+        ok: false,
+        message: "This month is already closed. Use Update Closing instead.",
+      });
+    }
+
+    if (!doc) {
+      doc = await MonthlyBalance.create({
+        familyId: familyObjectId,
+        month,
+        openingBalance: 0,
+        closingBalance: null,
+      });
+    }
+
+    const openingSnap = await openingSnapshotForMonth(req.familyId, month);
+    const movements = await accountMovementsForMonth(req.familyId, month);
+    const systemClosingSnap = buildClosingSnapshotFromOpening(
+      openingSnap.accounts,
+      movements
+    );
+
+    const draft = applyManualClosingBalances(
+      systemClosingSnap.accounts,
+      req.body?.accountBalances || []
+    );
+
+    await cleanupPendingInstallmentLedgers(req.familyId, month);
+    const summary = await financialSummaryForMonth(req.familyId, month);
+
+    doc.openingBalance = openingSnap.total;
+    doc.closingBalance = null;
+    doc.accountsOpening = openingSnap.accounts;
+    doc.accountsClosing = draft.accounts;
+    doc.manualAdjusted = draft.manualAdjusted;
+    doc.draftSavedAt = new Date();
+    doc.draftSavedByUserId = req.user.userId;
+
+    // Draft save must never close the month.
+    doc.closedAt = null;
+    doc.closedByUserId = null;
+
+    await doc.save();
+
+    res.json({
+      ok: true,
+      item: doc,
+      calc: {
+        ...summary,
+        openingTotal: openingSnap.total,
+        closingTotal: draft.total,
+        systemClosingTotal: systemClosingSnap.total,
+        manualAdjusted: draft.manualAdjusted,
+      },
+      accounts: {
+        opening: openingSnap.accounts,
+        closing: draft.accounts,
+        systemClosing: systemClosingSnap.accounts,
+      },
+    });
+  } catch (error) {
+    res.status(500).json({
+      ok: false,
+      message: error?.message || "Save balances failed",
     });
   }
 });
@@ -518,6 +642,10 @@ router.post("/close", requireAuth, requireFamily, async (req, res) => {
     doc.accountsOpening = openingSnap.accounts;
     doc.accountsClosing = manual.accounts;
     doc.manualAdjusted = manual.manualAdjusted;
+
+    // The month is now closed, so any temporary draft marker is cleared.
+    doc.draftSavedAt = null;
+    doc.draftSavedByUserId = null;
     doc.closedAt = new Date();
     doc.closedByUserId = req.user.userId;
 
