@@ -8,6 +8,8 @@ import Split from "../models/Split.js";
 import FamilyMember from "../models/FamilyMember.js";
 import Transaction from "../models/Transaction.js";
 import Settlement from "../models/Settlement.js";
+import SharedPurchase from "../models/SharedPurchase.js";
+import SharedPurchaseInstallment from "../models/SharedPurchaseInstallment.js";
 import { cleanupPendingInstallmentLedgers } from "../utils/installmentLedger.js";
 
 const router = Router();
@@ -127,6 +129,134 @@ async function calculateTransferEffects({ familyId, month, members }) {
   return effectMap;
 }
 
+
+async function calculateSharedPurchaseEffects({ familyId, month, memberIds }) {
+  const effectMap = {};
+  for (const userId of memberIds) {
+    effectMap[userId] = {
+      sharedPurchaseDue: 0,
+      sharedPurchaseReceivable: 0,
+      sharedPurchasePaid: 0,
+      sharedPurchaseReceived: 0,
+      sharedPurchaseObligationNet: 0,
+      sharedPurchasePaymentNet: 0,
+      sharedPurchaseNet: 0,
+    };
+  }
+
+  const installments = await SharedPurchaseInstallment.find({
+    familyId,
+    month,
+    paymentRequired: true,
+  })
+    .select("purchaseId userId amount status paidAt paymentTransactionId")
+    .lean();
+
+  if (!installments.length) return effectMap;
+
+  const purchaseIds = [...new Set(installments.map((row) => getId(row.purchaseId)).filter(Boolean))];
+  const purchases = await SharedPurchase.find({
+    familyId,
+    _id: { $in: purchaseIds },
+  })
+    .select("_id payerUserId title")
+    .lean();
+
+  const purchaseById = new Map(purchases.map((row) => [String(row._id), row]));
+
+  for (const installment of installments) {
+    const debtorId = getId(installment.userId);
+    const purchase = purchaseById.get(getId(installment.purchaseId));
+    const receiverId = getId(purchase?.payerUserId);
+    const amount = round2(installment.amount || 0);
+
+    if (!amount || amount <= 0) continue;
+    if (!effectMap[debtorId] || !effectMap[receiverId]) continue;
+    if (debtorId === receiverId) continue;
+
+    // The scheduled reimbursement is an interpersonal obligation:
+    // debtor owes the original upfront payer.
+    effectMap[debtorId].sharedPurchaseDue = round2(
+      effectMap[debtorId].sharedPurchaseDue + amount
+    );
+    effectMap[receiverId].sharedPurchaseReceivable = round2(
+      effectMap[receiverId].sharedPurchaseReceivable + amount
+    );
+
+    // A recorded Shared & Large Purchase payment settles that obligation.
+    // Keep the obligation and payment as separate components so the Wallet
+    // can show both parts instead of silently cancelling them.
+    if (installment.status === "paid") {
+      effectMap[debtorId].sharedPurchasePaid = round2(
+        effectMap[debtorId].sharedPurchasePaid + amount
+      );
+      effectMap[receiverId].sharedPurchaseReceived = round2(
+        effectMap[receiverId].sharedPurchaseReceived + amount
+      );
+    }
+  }
+
+  for (const userId of Object.keys(effectMap)) {
+    const row = effectMap[userId];
+    row.sharedPurchaseObligationNet = round2(
+      row.sharedPurchaseReceivable - row.sharedPurchaseDue
+    );
+
+    // Paying a reimbursement improves the payer's settlement position;
+    // receiving it reduces the receiver's outstanding claim.
+    row.sharedPurchasePaymentNet = round2(
+      row.sharedPurchasePaid - row.sharedPurchaseReceived
+    );
+
+    row.sharedPurchaseNet = round2(
+      row.sharedPurchaseObligationNet + row.sharedPurchasePaymentNet
+    );
+  }
+
+  return effectMap;
+}
+
+function buildWalletSettlementEffects({ memberIds, settlements }) {
+  const effectMap = {};
+  for (const userId of memberIds) {
+    effectMap[userId] = {
+      walletSettlementPaid: 0,
+      walletSettlementReceived: 0,
+      walletSettlementNet: 0,
+    };
+  }
+
+  for (const settlement of settlements) {
+    if (settlement.status !== "settled" || !settlement.affectsMonthlySettlement) continue;
+
+    const fromId = getId(settlement.fromUserId);
+    const toId = getId(settlement.toUserId);
+    const amount = round2(settlement.amount || 0);
+    if (!amount || amount <= 0) continue;
+
+    if (effectMap[fromId]) {
+      effectMap[fromId].walletSettlementPaid = round2(
+        effectMap[fromId].walletSettlementPaid + amount
+      );
+    }
+
+    if (effectMap[toId]) {
+      effectMap[toId].walletSettlementReceived = round2(
+        effectMap[toId].walletSettlementReceived + amount
+      );
+    }
+  }
+
+  for (const userId of Object.keys(effectMap)) {
+    const row = effectMap[userId];
+    row.walletSettlementNet = round2(
+      row.walletSettlementPaid - row.walletSettlementReceived
+    );
+  }
+
+  return effectMap;
+}
+
 function normalizeSettlement(doc) {
   const plain = typeof doc.toObject === "function" ? doc.toObject() : doc;
 
@@ -155,61 +285,68 @@ function buildSettlementInfo({ resultUsers, settlements }) {
   const byUser = new Map();
 
   for (const u of resultUsers) {
+    const preSettlementNet = round2(u.preSettlementNet || 0);
+    const finalNet = round2(u.net || 0);
+    const sharedPurchasePaid = round2(u.sharedPurchasePaid || 0);
+    const sharedPurchaseReceived = round2(u.sharedPurchaseReceived || 0);
+    const walletSettlementPaid = round2(u.walletSettlementPaid || 0);
+    const walletSettlementReceived = round2(u.walletSettlementReceived || 0);
+
     byUser.set(String(u.userId), {
       userId: u.userId,
       name: u.name,
-      net: round2(u.net || 0),
-      shouldPay: u.net < 0 ? round2(Math.abs(u.net)) : 0,
-      shouldReceive: u.net > 0 ? round2(u.net) : 0,
-      settledPaid: 0,
-      settledReceived: 0,
+      preSettlementNet,
+      net: finalNet,
+      shouldPay: preSettlementNet < 0 ? round2(Math.abs(preSettlementNet)) : 0,
+      shouldReceive: preSettlementNet > 0 ? round2(preSettlementNet) : 0,
+      sharedPurchasePaid,
+      sharedPurchaseReceived,
+      walletSettlementPaid,
+      walletSettlementReceived,
+      settledPaid: round2(sharedPurchasePaid + walletSettlementPaid),
+      settledReceived: round2(sharedPurchaseReceived + walletSettlementReceived),
       pastMarkedPaid: 0,
       pastMarkedReceived: 0,
-      pendingPay: u.net < 0 ? round2(Math.abs(u.net)) : 0,
-      pendingReceive: u.net > 0 ? round2(u.net) : 0,
-      status: u.net === 0 ? "settled" : "pending",
+      pendingPay: finalNet < 0 ? round2(Math.abs(finalNet)) : 0,
+      pendingReceive: finalNet > 0 ? round2(finalNet) : 0,
+      status: Math.abs(finalNet) <= 0.009 ? "settled" : "pending",
     });
   }
 
   for (const s of settlements) {
-    if (s.status !== "settled") continue;
+    if (s.status !== "settled" || s.settlementType !== "past_pending") continue;
 
     const amount = round2(s.amount || 0);
     const fromId = getId(s.fromUserId);
     const toId = getId(s.toUserId);
 
-    if (s.affectsMonthlySettlement) {
-      if (byUser.has(fromId)) {
-        byUser.get(fromId).settledPaid = round2(byUser.get(fromId).settledPaid + amount);
-      }
-      if (byUser.has(toId)) {
-        byUser.get(toId).settledReceived = round2(byUser.get(toId).settledReceived + amount);
-      }
-    } else if (s.settlementType === "past_pending") {
-      if (byUser.has(fromId)) {
-        byUser.get(fromId).pastMarkedPaid = round2(byUser.get(fromId).pastMarkedPaid + amount);
-      }
-      if (byUser.has(toId)) {
-        byUser.get(toId).pastMarkedReceived = round2(byUser.get(toId).pastMarkedReceived + amount);
-      }
+    if (byUser.has(fromId)) {
+      byUser.get(fromId).pastMarkedPaid = round2(
+        byUser.get(fromId).pastMarkedPaid + amount
+      );
+    }
+    if (byUser.has(toId)) {
+      byUser.get(toId).pastMarkedReceived = round2(
+        byUser.get(toId).pastMarkedReceived + amount
+      );
     }
   }
 
-  const summary = Array.from(byUser.values()).map((row) => {
-    const pendingPay = round2(Math.max(0, Number(row.shouldPay || 0) - Number(row.settledPaid || 0)));
-    const pendingReceive = round2(Math.max(0, Number(row.shouldReceive || 0) - Number(row.settledReceived || 0)));
+  const summary = Array.from(byUser.values());
 
-    return {
-      ...row,
-      pendingPay,
-      pendingReceive,
-      status: pendingPay <= 0.009 && pendingReceive <= 0.009 ? "settled" : "pending",
-    };
-  });
-
-  const requiredTotal = round2(summary.reduce((sum, row) => sum + Number(row.shouldPay || 0), 0));
-  const monthlySettled = round2(summary.reduce((sum, row) => sum + Number(row.settledPaid || 0), 0));
-  const pendingTotal = round2(summary.reduce((sum, row) => sum + Number(row.pendingPay || 0), 0));
+  const requiredTotal = round2(
+    summary.reduce((sum, row) => sum + Number(row.shouldPay || 0), 0)
+  );
+  const sharedPurchaseSettled = round2(
+    summary.reduce((sum, row) => sum + Number(row.sharedPurchasePaid || 0), 0)
+  );
+  const walletSettled = round2(
+    summary.reduce((sum, row) => sum + Number(row.walletSettlementPaid || 0), 0)
+  );
+  const monthlySettled = round2(sharedPurchaseSettled + walletSettled);
+  const pendingTotal = round2(
+    summary.reduce((sum, row) => sum + Number(row.pendingPay || 0), 0)
+  );
   const pastPendingSettled = round2(
     settlements
       .filter((s) => s.status === "settled" && s.settlementType === "past_pending")
@@ -219,8 +356,8 @@ function buildSettlementInfo({ resultUsers, settlements }) {
   let settlement = null;
 
   if (resultUsers.length === 2) {
-    const payer = summary.find((row) => row.shouldPay > 0);
-    const receiver = summary.find((row) => row.shouldReceive > 0);
+    const payer = summary.find((row) => row.pendingPay > 0.009);
+    const receiver = summary.find((row) => row.pendingReceive > 0.009);
     const amount = round2(Math.min(payer?.pendingPay || 0, receiver?.pendingReceive || 0));
 
     if (payer && receiver && amount > 0.009) {
@@ -238,6 +375,8 @@ function buildSettlementInfo({ resultUsers, settlements }) {
     settlementTotals: {
       requiredTotal,
       monthlySettled,
+      sharedPurchaseSettled,
+      walletSettled,
       pendingTotal,
       pastPendingSettled,
     },
@@ -342,16 +481,37 @@ router.get("/summary", requireAuth, requireFamily, async (req, res) => {
     }
 
     // -----------------------------
-    // 4) Owner-aware transfer effect
+    // 4) Transfers + managed Shared/Large Purchase obligations
+    //    + already-recorded Wallet settlements
     // -----------------------------
-    const transferMap = await calculateTransferEffects({
-      familyId: req.familyId,
-      month,
-      members,
+    const [transferMap, sharedPurchaseMap, rawSettlements] = await Promise.all([
+      calculateTransferEffects({
+        familyId: req.familyId,
+        month,
+        members,
+      }),
+      calculateSharedPurchaseEffects({
+        familyId: req.familyId,
+        month,
+        memberIds: userIdStrings,
+      }),
+      Settlement.find({ familyId: req.familyId, month })
+        .sort({ date: -1, createdAt: -1 })
+        .populate("fromUserId", "name email")
+        .populate("toUserId", "name email")
+        .populate("fromAccountId", "name owner type")
+        .populate("toAccountId", "name owner type")
+        .lean(),
+    ]);
+
+    const settlements = rawSettlements.map(normalizeSettlement);
+    const walletSettlementMap = buildWalletSettlementEffects({
+      memberIds: userIdStrings,
+      settlements,
     });
 
     // -----------------------------
-    // 5) Build result
+    // 5) Build the complete member settlement position
     // -----------------------------
     const resultUsers = [];
 
@@ -367,17 +527,55 @@ router.get("/summary", requireAuth, requireFamily, async (req, res) => {
       const transferOut = round2(transferMap[uid]?.transferOut || 0);
       const transferNet = round2(transferIn - transferOut);
 
-      // Settlement net keeps the original expense-sharing meaning:
-      // positive = paid more than share; negative = paid less than share.
-      const net = round2(paid - share);
+      // Normal expense settlement:
+      // + = this member paid more than their normal expense share.
+      // - = this member paid less than their normal expense share.
+      const expenseNet = round2(paid - share);
 
-      // Share-based remaining is useful for settlement understanding:
-      // income - personal expense share + transfer net.
+      const sharedPurchaseDue = round2(sharedPurchaseMap[uid]?.sharedPurchaseDue || 0);
+      const sharedPurchaseReceivable = round2(
+        sharedPurchaseMap[uid]?.sharedPurchaseReceivable || 0
+      );
+      const sharedPurchasePaid = round2(sharedPurchaseMap[uid]?.sharedPurchasePaid || 0);
+      const sharedPurchaseReceived = round2(
+        sharedPurchaseMap[uid]?.sharedPurchaseReceived || 0
+      );
+      const sharedPurchaseObligationNet = round2(
+        sharedPurchaseMap[uid]?.sharedPurchaseObligationNet || 0
+      );
+      const sharedPurchasePaymentNet = round2(
+        sharedPurchaseMap[uid]?.sharedPurchasePaymentNet || 0
+      );
+      const sharedPurchaseNet = round2(sharedPurchaseMap[uid]?.sharedPurchaseNet || 0);
+
+      const walletSettlementPaid = round2(
+        walletSettlementMap[uid]?.walletSettlementPaid || 0
+      );
+      const walletSettlementReceived = round2(
+        walletSettlementMap[uid]?.walletSettlementReceived || 0
+      );
+      const walletSettlementNet = round2(
+        walletSettlementMap[uid]?.walletSettlementNet || 0
+      );
+
+      // Gross interpersonal position before any reimbursement/settlement payment.
+      // This combines normal expense sharing with the selected month's
+      // Shared & Large Purchase obligations.
+      const preSettlementNet = round2(expenseNet + sharedPurchaseObligationNet);
+
+      // Shared purchase Record Payment and Wallet Settlement both reduce the
+      // member-to-member obligation in the direction money was actually paid.
+      // Keeping them as signed adjustments also handles an overpayment by
+      // correctly flipping the final payer/receiver direction.
+      const net = round2(
+        preSettlementNet + sharedPurchasePaymentNet + walletSettlementNet
+      );
+
+      // Share-based remaining is for normal monthly expense-share context.
       const shareBasedRemaining = round2(income - share + transferNet);
 
-      // Actual wallet/cash remaining:
-      // income - actually paid expense + transfer net.
-      // This is what the Wallet page should show as Remaining Balance.
+      // Actual account/cash remaining. All real transfers (including purchase
+      // reimbursements and Wallet settlements) are already included here.
       const cashAfterPaid = round2(income - paid + transferNet);
       const remaining = cashAfterPaid;
 
@@ -390,6 +588,18 @@ router.get("/summary", requireAuth, requireFamily, async (req, res) => {
         transferIn,
         transferOut,
         transferNet,
+        expenseNet,
+        sharedPurchaseDue,
+        sharedPurchaseReceivable,
+        sharedPurchasePaid,
+        sharedPurchaseReceived,
+        sharedPurchaseObligationNet,
+        sharedPurchasePaymentNet,
+        sharedPurchaseNet,
+        walletSettlementPaid,
+        walletSettlementReceived,
+        walletSettlementNet,
+        preSettlementNet,
         net,
         remaining,
         cashAfterPaid,
@@ -398,18 +608,8 @@ router.get("/summary", requireAuth, requireFamily, async (req, res) => {
     }
 
     // -----------------------------
-    // 6) Settlement records + pending suggestion
+    // 6) Final pending suggestion after every supported settlement component
     // -----------------------------
-    const settlements = (
-      await Settlement.find({ familyId: req.familyId, month })
-        .sort({ date: -1, createdAt: -1 })
-        .populate("fromUserId", "name email")
-        .populate("toUserId", "name email")
-        .populate("fromAccountId", "name owner type")
-        .populate("toAccountId", "name owner type")
-        .lean()
-    ).map(normalizeSettlement);
-
     const settlementInfo = buildSettlementInfo({ resultUsers, settlements });
 
     res.json({
