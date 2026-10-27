@@ -11,7 +11,11 @@ import FamilyMember from "../models/FamilyMember.js";
 import Account from "../models/Account.js";
 
 import { splitEqual, splitPersonal, splitRatio, splitFixed } from "../utils/splitCalc.js";
-import { cleanupPendingInstallmentLedgers } from "../utils/installmentLedger.js";
+import { requireOpenMonth } from "../utils/postingPreflight.js";
+import { positiveMoney, nonnegativeMoney, assertExpenseSplit, postingError } from "../utils/postingRules.js";
+import { runAtomicPosting } from "../utils/financialPostingTransaction.js";
+import { createIdempotentFinancialPosting } from "../utils/idempotentFinancialPosting.js";
+import { sourceOwnerOfTransaction } from "../utils/managedFinancialRecords.js";
 
 function monthKey(dateInput) {
   const d = new Date(dateInput);
@@ -34,22 +38,18 @@ function round2(n) {
 function accountOwnerMatchesMember(account, memberUserId, memberNameByUserId) {
   const owner = String(account?.owner || "").trim().toLowerCase();
 
-  if (!owner) return true;
+  if (!owner) return false;
   if (["joint", "shared", "family"].includes(owner)) return true;
 
   const memberName = String(memberNameByUserId.get(String(memberUserId)) || "")
     .trim()
     .toLowerCase();
 
-  if (!memberName) return true;
+  if (!memberName) return false;
 
-  const memberParts = memberName.split(/\s+/).filter(Boolean);
-
-  return (
-    memberName.includes(owner) ||
-    owner.includes(memberName) ||
-    memberParts.some((part) => owner.includes(part) || part.includes(owner))
-  );
+  if (owner === 'mahbub') return memberName.includes('mahbub');
+  if (owner === 'mirza') return memberName.includes('mirza');
+  return false;
 }
 
 async function buildExpensePayments({ familyId, amount, paidByUserId, fromAccountId, paymentMode, paymentParts }) {
@@ -136,7 +136,12 @@ async function buildExpensePayments({ familyId, amount, paidByUserId, fromAccoun
     throw err;
   }
 
+  if (new Set(rows.map(r => String(r.userId))).size !== rows.length) {
+    throw postingError('A member may appear only once in a split payment. Combine their payments into one account row.');
+  }
+
   for (const row of rows) {
+    positiveMoney(row.amount, 'Payment part');
     if (!row.userId || !validUserIds.includes(String(row.userId))) {
       const err = new Error("Invalid member in split payment");
       err.status = 400;
@@ -169,8 +174,8 @@ async function buildExpensePayments({ familyId, amount, paidByUserId, fromAccoun
     }
   }
 
-  const totalPaid = round2(rows.reduce((sum, row) => sum + Number(row.amount || 0), 0));
-  if (totalPaid !== round2(amount)) {
+  const totalPaid = rows.reduce((sum, row) => sum + Math.round(Number(row.amount || 0) * 100), 0);
+  if (totalPaid !== Math.round(amount * 100)) {
     const err = new Error("Split payment amounts must sum to the total transaction amount");
     err.status = 400;
     throw err;
@@ -305,10 +310,14 @@ async function buildExpenseSplit({ familyId, amount, paidByUserId, split }) {
   }
 
   if (!Array.isArray(splitRows) || splitRows.length === 0) {
-    const err = new Error("Invalid split data");
-    err.status = 400;
-    throw err;
+    throw postingError('Invalid split data');
   }
+  assertExpenseSplit(splitRows, amount, userIds);
+  // The split config itself may include repeated member IDs even if totals align.
+  if (splitType === 'ratio' && new Set(normalizedSplit.ratios.map(r => String(r.userId))).size !== normalizedSplit.ratios.length)
+    throw postingError('Each member can have only one ratio');
+  if (splitType === 'fixed' && new Set(normalizedSplit.fixed.map(r => String(r.userId))).size !== normalizedSplit.fixed.length)
+    throw postingError('Each member can have only one fixed share');
 
   return { splitRows, normalizedSplit };
 }
@@ -428,10 +437,9 @@ async function validateTransactionInput(req, body = {}) {
   const mk = monthKey(date);
   if (!mk) return { ok: false, message: "Invalid date" };
 
-  const amt = Number(amount);
-  if (!amt || amt <= 0) {
-    return { ok: false, message: "Amount must be > 0" };
-  }
+  let amt;
+  try { amt = positiveMoney(amount); }
+  catch (e) { return { ok: false, message: e.message }; }
 
   if (txType === "income") {
     if (!categoryId) return { ok: false, message: "Category required for income" };
@@ -450,6 +458,27 @@ async function validateTransactionInput(req, body = {}) {
     if (String(fromAccountId) === String(toAccountId)) {
       return { ok: false, message: "From and To accounts must be different" };
     }
+  }
+
+  // Resolve category and funding account within this family (not by arbitrary IDs).
+  if (txType !== 'transfer') {
+    const cat = await Category.findOne({ _id: categoryId, familyId: req.familyId });
+    if (!cat || cat.kind !== txType) return { ok: false, message: `Select a valid ${txType} category` };
+  }
+  if (txType === 'income') {
+    const [member, account] = await Promise.all([
+      FamilyMember.findOne({ familyId: req.familyId, userId: receivedByUserId }).populate('userId', 'name'),
+      Account.findOne({ _id: toAccountId, familyId: req.familyId, isActive: { $ne: false } }),
+    ]);
+    if (!member || !account || !['cash','bank','wallet'].includes(account.type) ||
+        !accountOwnerMatchesMember(account, receivedByUserId, new Map([[String(receivedByUserId), member.userId?.name || '']]))) {
+      return { ok: false, message: 'Select an active income account belonging to the receiving member' };
+    }
+  }
+  if (txType === 'transfer') {
+    const accounts = await Account.find({ familyId: req.familyId, isActive: { $ne: false }, _id: { $in: [fromAccountId, toAccountId] } }).lean();
+    if (accounts.length !== 2 || accounts.some(a => !['cash','bank','wallet','savings','investment'].includes(a.type)))
+      return { ok: false, message: 'Both transfer accounts must be active and belong to this family' };
   }
 
   let normalizedSplit = null;
@@ -548,7 +577,6 @@ router.get("/summary", requireAuth, requireFamily, async (req, res) => {
   const { month } = req.query;
   if (!month) return res.status(400).json({ ok: false, message: "month is required" });
 
-  await cleanupPendingInstallmentLedgers(req.familyId, month);
 
   const familyObjectId = new mongoose.Types.ObjectId(req.familyId);
   const [ledgerRows, transferRows] = await Promise.all([
@@ -581,112 +609,77 @@ router.get("/summary", requireAuth, requireFamily, async (req, res) => {
   res.json({ ok: true, totals: out });
 });
 
-// Create
+// Manual creation is fully atomic: Transaction + LedgerEntry + Split, or none.
 router.post("/", requireAuth, requireFamily, async (req, res) => {
   try {
     const check = await validateTransactionInput(req, req.body || {});
     if (!check.ok) return res.status(400).json({ ok: false, message: check.message });
-
     const payload = check.payload;
-
-    const item = await Transaction.create({
-      familyId: req.familyId,
-      txType: payload.txType,
-      date: new Date(payload.date),
-      month: payload.month,
-      categoryId: payload.categoryId,
-      amount: payload.amount,
-      note: payload.note,
-      fromAccountId: payload.fromAccountId,
-      toAccountId: payload.toAccountId,
-      paidByUserId: payload.paidByUserId,
-      receivedByUserId: payload.receivedByUserId,
-      paymentMode: payload.paymentMode,
-      paymentParts: payload.paymentParts,
-      split: payload.split,
-      createdByUserId: req.user.userId,
+    if (payload.month < '2026-10') return res.status(409).json({ ok: false, message: 'Months before October 2026 are protected from Phase 5 changes.' });
+    const result = await createIdempotentFinancialPosting(req, 'manual.transaction.create', async () => {
+      await requireOpenMonth(req.familyId, payload.month);
+      const tx = await Transaction.create({
+        familyId: req.familyId, txType: payload.txType, date: new Date(payload.date),
+        month: payload.month, categoryId: payload.categoryId, amount: payload.amount,
+        note: payload.note, fromAccountId: payload.fromAccountId,
+        toAccountId: payload.toAccountId, paidByUserId: payload.paidByUserId,
+        receivedByUserId: payload.receivedByUserId, paymentMode: payload.paymentMode,
+        paymentParts: payload.paymentParts, split: payload.split,
+        sourceType: 'manual', createdByUserId: req.user.userId,
+      });
+      await syncTransactionLedger({ req, tx, payload });
+      return tx._id;
     });
-
-    await syncTransactionLedger({ req, tx: item, payload });
-
-    res.status(201).json({ ok: true, item });
-  } catch (e) {
-    res.status(500).json({ ok: false, message: e?.message || "Create failed" });
-  }
+    const item = await Transaction.findOne({ familyId: req.familyId, _id: result.resultId });
+    return res.status(result.replayed ? 200 : 201).json({ ok: true, item, replayed: result.replayed });
+  } catch (e) { return res.status(e.status || 500).json({ ok: false, message: e.message || 'Create failed' }); }
 });
 
-// Update
+// Edits check BOTH months and preserve original source flags.
 router.put("/:id", requireAuth, requireFamily, async (req, res) => {
   try {
-    const { id } = req.params;
-    const existing = await Transaction.findOne({ _id: id, familyId: req.familyId });
-    if (!existing) return res.status(404).json({ ok: false, message: "Not found" });
-
-    if (String(existing.sourceType || "").startsWith("shared_purchase")) {
-      return res.status(400).json({
-        ok: false,
-        message: "Manage this transaction from Shared Purchases.",
-      });
-    }
-
+    const existing = await Transaction.findOne({ _id: req.params.id, familyId: req.familyId });
+    if (!existing) return res.status(404).json({ ok: false, message: 'Not found' });
+    const managedBy = await sourceOwnerOfTransaction(req.familyId, existing);
+    if (managedBy) return res.status(409).json({ ok: false, message: `This payment belongs to ${managedBy}. Edit it in its original section.` });
     const check = await validateTransactionInput(req, req.body || {});
     if (!check.ok) return res.status(400).json({ ok: false, message: check.message });
-
     const payload = check.payload;
-
-    existing.txType = payload.txType;
-    existing.date = new Date(payload.date);
-    existing.month = payload.month;
-    existing.categoryId = payload.categoryId;
-    existing.amount = payload.amount;
-    existing.note = payload.note;
-    existing.fromAccountId = payload.fromAccountId;
-    existing.toAccountId = payload.toAccountId;
-    existing.paidByUserId = payload.paidByUserId;
-    existing.receivedByUserId = payload.receivedByUserId;
-    existing.paymentMode = payload.paymentMode;
-    existing.paymentParts = payload.paymentParts;
-    existing.split = payload.split;
-    await existing.save();
-
-    await syncTransactionLedger({ req, tx: existing, payload });
-
-    res.json({ ok: true, item: existing });
-  } catch (e) {
-    res.status(500).json({ ok: false, message: e?.message || "Update failed" });
-  }
+    if (payload.month < '2026-10' || existing.month < '2026-10') return res.status(409).json({ ok: false, message: 'Months before October 2026 are preserved.' });
+    const updated = await runAtomicPosting(async () => {
+      await requireOpenMonth(req.familyId, existing.month);
+      await requireOpenMonth(req.familyId, payload.month);
+      const fields = ['txType','month','categoryId','amount','note','fromAccountId','toAccountId','paidByUserId','receivedByUserId','paymentMode','paymentParts','split'];
+      for (const field of fields) existing[field] = payload[field];
+      existing.date = new Date(payload.date);
+      await existing.save();
+      await syncTransactionLedger({ req, tx: existing, payload });
+      return existing;
+    });
+    return res.json({ ok: true, item: updated });
+  } catch (e) { return res.status(e.status || 500).json({ ok: false, message: e.message || 'Update failed' }); }
 });
 
-// Delete (SYNC SAFE)
+// Delete manual Tx and every linked Ledger/Split atomically.
 router.delete("/:id", requireAuth, requireFamily, async (req, res) => {
-  const { id } = req.params;
-
-  // 1) find transaction first
-  const tx = await Transaction.findOne({ _id: id, familyId: req.familyId }).select("_id sourceType");
-  if (!tx) return res.status(404).json({ ok: false, message: "Not found" });
-
-  if (String(tx.sourceType || "").startsWith("shared_purchase")) {
-    return res.status(400).json({
-      ok: false,
-      message: "Manage this transaction from Shared Purchases.",
+  try {
+    const tx = await Transaction.findOne({ _id: req.params.id, familyId: req.familyId });
+    if (!tx) return res.status(404).json({ ok: false, message: 'Not found' });
+    const managedBy = await sourceOwnerOfTransaction(req.familyId, tx);
+    if (managedBy) return res.status(409).json({ ok: false, message: `This payment belongs to ${managedBy}. Reverse it in its original section.` });
+    if (tx.month < '2026-10') return res.status(409).json({ ok: false, message: 'Historical records are protected.' });
+    const removed = await runAtomicPosting(async () => {
+      await requireOpenMonth(req.familyId, tx.month);
+      const entries = await LedgerEntry.find({ familyId: req.familyId, sourceId: tx._id });
+      for (const entry of entries) {
+        await Split.deleteMany({ familyId: req.familyId, ledgerEntryId: entry._id });
+        await LedgerEntry.deleteOne({ familyId: req.familyId, _id: entry._id });
+      }
+      await Transaction.deleteOne({ familyId: req.familyId, _id: tx._id });
+      return entries.length;
     });
-  }
-
-  // 2) delete ALL ledger entries that point to this tx (even if sourceType is empty/wrong)
-  const ledgerEntries = await LedgerEntry.find({
-    familyId: req.familyId,
-    sourceId: tx._id,
-  }).select("_id");
-
-  for (const le of ledgerEntries) {
-    await Split.deleteMany({ familyId: req.familyId, ledgerEntryId: le._id });
-    await LedgerEntry.deleteOne({ _id: le._id, familyId: req.familyId });
-  }
-
-  // 3) now delete the transaction
-  await Transaction.deleteOne({ _id: tx._id, familyId: req.familyId });
-
-  res.json({ ok: true, removedLedgerEntries: ledgerEntries.length });
+    return res.json({ ok: true, removedLedgerEntries: removed });
+  } catch (e) { return res.status(e.status || 500).json({ ok: false, message: e.message || 'Delete failed' }); }
 });
 
 export default router;

@@ -11,7 +11,11 @@ import GroceryTransaction from "../models/GroceryTransaction.js";
 import FixedInstance from "../models/FixedInstance.js";
 import EMIInstallment from "../models/EMIInstallment.js";
 import { splitEqual, splitPersonal, splitRatio, splitFixed } from "../utils/splitCalc.js";
-import { cleanupPendingInstallmentLedgers } from "../utils/installmentLedger.js";
+import { loadSharedBudgetMonth } from "../utils/sharedBudgetReadModel.js";
+import { sourceOwnerOfLedger } from "../utils/managedFinancialRecords.js";
+import { reconcileLedgerMembers } from "../utils/ledgerReconciliation.js";
+import { runAtomicPosting } from "../utils/financialPostingTransaction.js";
+import { requireOpenMonth } from "../utils/postingPreflight.js";
 
 const router = Router();
 
@@ -23,7 +27,6 @@ router.get("/", requireAuth, requireFamily, async (req, res) => {
   const { month } = req.query;
   if (!month) return res.status(400).json({ ok: false, message: "month is required" });
 
-  await cleanupPendingInstallmentLedgers(req.familyId, month);
 
   const entries = await LedgerEntry.find({ familyId: req.familyId, month })
     .sort({ date: -1, createdAt: -1 })
@@ -49,97 +52,64 @@ router.get("/", requireAuth, requireFamily, async (req, res) => {
     });
   }
 
-  const items = entries.map((e) => ({
+  const postedItems = entries.map((e) => ({
     ...e.toObject(),
     splits: splitMap.get(String(e._id)) || [],
   }));
-
-  res.json({ ok: true, items });
+  const budgetView = await loadSharedBudgetMonth(req.familyId, month, postedItems);
+  // Virtual schedule rows are clearly tagged. They are NOT transactions and
+  // never create a second bank debit or a second settlement obligation.
+  // A read-only reconciliation of funding versus cost responsibility.
+  // Virtual scheduled purchase allocations are excluded from ordinary settlement.
+  const [members, transactionRows] = await Promise.all([
+    FamilyMember.find({ familyId: req.familyId }).populate('userId', 'name').lean(),
+    Transaction.find({ familyId: req.familyId, month, txType: 'expense' }).lean(),
+  ]);
+  const memberReconciliation = reconcileLedgerMembers({
+    members: members.map(m => ({ userId: m.userId?._id || m.userId, name: m.userId?.name || 'Member' })),
+    entries: budgetView.regularEntries,
+    transactions: transactionRows,
+  });
+  res.json({ ok: true, items: budgetView.entries, budgetAllocation: budgetView.summary, memberReconciliation });
 });
 
 /**
  * POST /api/ledger
  * Create ledger entry + splits manually (if you have an admin UI for split editing later)
  */
-router.post("/", requireAuth, requireFamily, async (req, res) => {
-  const { entryType, date, categoryId, amountTotal, paidByUserId, receivedByUserId, note, splits } = req.body || {};
-
-  if (!entryType || !["income", "expense"].includes(entryType)) {
-    return res.status(400).json({ ok: false, message: "Invalid entryType" });
-  }
-  if (!date) return res.status(400).json({ ok: false, message: "date required" });
-  if (!categoryId) return res.status(400).json({ ok: false, message: "categoryId required" });
-
-  const amt = Number(amountTotal);
-  if (!amt || amt <= 0) return res.status(400).json({ ok: false, message: "amountTotal must be > 0" });
-
-  const dt = new Date(date);
-  if (Number.isNaN(dt.getTime())) return res.status(400).json({ ok: false, message: "Invalid date" });
-
-  const y = dt.getFullYear();
-  const m = String(dt.getMonth() + 1).padStart(2, "0");
-  const month = `${y}-${m}`;
-
-  const cat = await Category.findOne({ _id: categoryId, familyId: req.familyId });
-  if (!cat) return res.status(400).json({ ok: false, message: "Invalid categoryId" });
-
-  const manualId = new mongoose.Types.ObjectId();
-
-  const entry = await LedgerEntry.create({
-    _id: manualId,
-    familyId: req.familyId,
-    entryType,
-    financialType: cat.financialType || (cat.kind === "income" ? "income" : "living"),
-    module: "manual",
-    date: dt,
-    month,
-    categoryId,
-    amountTotal: amt,
-    paidByUserId: entryType === "expense" ? paidByUserId || null : null,
-    receivedByUserId: entryType === "income" ? receivedByUserId || null : null,
-    note: (note || "").trim(),
-    sourceType: "manual",
-    sourceId: manualId,
-    createdByUserId: req.user.userId,
-  });
-
-  if (Array.isArray(splits) && splits.length > 0) {
-    await Split.insertMany(
-      splits.map((s) => ({
-        familyId: req.familyId,
-        ledgerEntryId: entry._id,
-        userId: s.userId,
-        shareAmount: Number(s.shareAmount || 0),
-      }))
-    );
-  }
-
-  res.json({ ok: true, entryId: entry._id });
+router.post("/", requireAuth, requireFamily, async (_req, res) => {
+  return res.status(409).json({ ok: false,
+    message: 'Use Add Transaction in Ledger so both bank/cash funding and expense responsibility are recorded together. Direct Ledger-only financial postings are disabled.' });
 });
 
 /**
  * DELETE /api/ledger/:id
  */
 router.delete("/:id", requireAuth, requireFamily, async (req, res) => {
-  const entry = await LedgerEntry.findOne({ _id: req.params.id, familyId: req.familyId });
-  if (!entry) return res.status(404).json({ ok: false, message: "Not found" });
-
-  if (String(entry.sourceType || "") === "shared_purchase_installment") {
-    return res.status(400).json({
-      ok: false,
-      message: "Manage this allocation from Shared Purchases.",
+  try {
+    const entry = await LedgerEntry.findOne({ _id: req.params.id, familyId: req.familyId });
+    if (!entry) return res.status(404).json({ ok: false, message: 'Not found' });
+    const linkedTx = entry.sourceId
+      ? await Transaction.findOne({ _id: entry.sourceId, familyId: req.familyId }) : null;
+    const managedBy = await sourceOwnerOfLedger(req.familyId, entry, linkedTx);
+    if (managedBy) return res.status(409).json({ ok: false,
+      message: `This entry belongs to ${managedBy}. Delete or reverse it from its original section.` });
+    if (String(entry.month) < '2026-10' || (linkedTx && String(linkedTx.month) < '2026-10')) {
+      return res.status(409).json({ ok: false, message: 'Historical months before October 2026 are preserved.' });
+    }
+    await runAtomicPosting(async () => {
+      await requireOpenMonth(req.familyId, entry.month);
+      if (linkedTx) await requireOpenMonth(req.familyId, linkedTx.month);
+      // Delete ALL linked Ledger rows, not just the clicked row.
+      const entries = linkedTx ? await LedgerEntry.find({ familyId: req.familyId, sourceId: linkedTx._id }) : [entry];
+      for (const e of entries) {
+        await Split.deleteMany({ familyId: req.familyId, ledgerEntryId: e._id });
+        await LedgerEntry.deleteOne({ familyId: req.familyId, _id: e._id });
+      }
+      if (linkedTx) await Transaction.deleteOne({ familyId: req.familyId, _id: linkedTx._id });
     });
-  }
-
-  // ✅ If this ledger entry was created from a transaction, delete that transaction too
-  if (String(entry.sourceType || "") === "transaction" && entry.sourceId) {
-    await Transaction.deleteOne({ _id: entry.sourceId, familyId: req.familyId });
-  }
-
-  await Split.deleteMany({ familyId: req.familyId, ledgerEntryId: entry._id });
-  await LedgerEntry.deleteOne({ _id: entry._id, familyId: req.familyId });
-
-  res.json({ ok: true });
+    return res.json({ ok: true });
+  } catch (e) { return res.status(e.status || 500).json({ ok: false, message: e.message || 'Delete failed' }); }
 });
 
 /**
@@ -151,6 +121,9 @@ router.post("/rebuild", requireAuth, requireFamily, async (req, res) => {
   try {
     const { month } = req.body || {};
     if (!month) return res.status(400).json({ ok: false, message: "month is required (YYYY-MM)" });
+    if (month < '2026-10') return res.status(409).json({ ok: false, message: 'Historical months are preserved.' });
+    if (req.body?.confirm !== 'REPAIR_CURRENT_MONTH') return res.status(409).json({ ok: false, message: 'Maintenance requires explicit confirmation. Review source entries before rebuilding.' });
+    await requireOpenMonth(req.familyId, month);
 
     const familyId = req.familyId;
     const createdByUserId = req.user.userId;
@@ -355,6 +328,9 @@ router.post("/normalize", requireAuth, requireFamily, async (req, res) => {
   try {
     const { month } = req.body || {};
     if (!month) return res.status(400).json({ ok: false, message: "month is required (YYYY-MM)" });
+    if (month < '2026-10') return res.status(409).json({ ok: false, message: 'Historical months are preserved.' });
+    if (req.body?.confirm !== 'REPAIR_CURRENT_MONTH') return res.status(409).json({ ok: false, message: 'Maintenance requires explicit confirmation. Review source entries before rebuilding.' });
+    await requireOpenMonth(req.familyId, month);
 
     const familyId = req.familyId;
 

@@ -8,7 +8,12 @@ import Split from "../models/Split.js";
 import FamilyMember from "../models/FamilyMember.js";
 import Account from "../models/Account.js";
 import Transaction from "../models/Transaction.js";
-import { cleanupPendingInstallmentLedgers } from "../utils/installmentLedger.js";
+import { calculateOrdinaryExpenseShares } from "../utils/expenseFunding.js";
+import { loadSharedBudgetMonth } from "../utils/sharedBudgetReadModel.js";
+import { summarizeDashboardBudget } from "../utils/dashboardBudgetMath.js";
+import { loadReconciledMonth } from "../utils/reconciledAccounts.js";
+import { summarizeLiquidBalances } from "../utils/reconciledAccountMath.js";
+import { calculateMonthlyLiquidFlow } from "../utils/monthlyLiquidFlow.js";
 
 const router = Router();
 
@@ -36,7 +41,7 @@ async function computeSavingsV2(familyId, month) {
 
   const savingsAccounts = await Account.find({
     familyId,
-    isActive: true,
+    // Inactive savings accounts still hold historical assets.
     type: { $in: ["savings", "investment"] },
   }).select("_id openingBalance");
 
@@ -108,11 +113,10 @@ async function computeSavingsV2(familyId, month) {
 router.get("/summary", requireAuth, requireFamily, async (req, res) => {
   try {
     const month = req.query.month;
-    if (!month) {
-      return res.status(400).json({ ok: false, message: "month required" });
+    if (!parseMonth(month) || !/^(?:\d{4})-(?:0[1-9]|1[0-2])$/.test(String(month))) {
+      return res.status(400).json({ ok: false, message: "Valid month (YYYY-MM) required" });
     }
 
-    await cleanupPendingInstallmentLedgers(req.familyId, month);
 
     /* ===========================================
        1️⃣ LOAD FAMILY USERS
@@ -128,59 +132,49 @@ router.get("/summary", requireAuth, requireFamily, async (req, res) => {
       month,
     });
 
-    // v2 classification totals (driven by LedgerEntry.financialType)
-    let totalIncome = 0;
-    let totalLiving = 0;
-    let totalDebt = 0;
-    let totalLedgerInvestment = 0;
+    // Budget reports include every scheduled family member's share even if
+    // their reimbursement has not been paid yet. The old posted installments
+    // are excluded from this READ model to avoid counting either share twice.
+    const budgetView = await loadSharedBudgetMonth(req.familyId, month, entries);
+    const budgetEntries = budgetView.entries;
 
-    for (const e of entries) {
-      const amt = Number(e.amountTotal || 0);
-      const ft = e.financialType || (e.entryType === "income" ? "income" : "living");
-
-      if (ft === "income") totalIncome += amt;
-      else if (ft === "living") totalLiving += amt;
-      else if (ft === "debt") totalDebt += amt;
-      else if (ft === "investment") totalLedgerInvestment += amt;
-    }
-
-    totalIncome = round2(totalIncome);
-    totalLiving = round2(totalLiving);
-    totalDebt = round2(totalDebt);
-    totalLedgerInvestment = round2(totalLedgerInvestment);
-
-    /* ===========================================
-       3️⃣ SAVINGS V2 (Account-based transfers)
-       Savings deposit = transfer into savings/investment accounts.
-       Withdraw = transfer out of savings/investment accounts.
-       NOT an expense.
-    =========================================== */
-
+    // Phase 4A: budget is a planning view. Cash is an account-transaction view.
     const sv2 = await computeSavingsV2(req.familyId, month);
-    const savingsContribution = sv2.monthNet; // net deposit - withdraw
-
-    /* ===========================================
-       4️⃣ TOTAL SAVINGS ASSET (up to this month)
-    =========================================== */
-
+    const budget = summarizeDashboardBudget({
+      entries: budgetEntries,
+      savingsContribution: sv2.monthNet,
+    });
+    // UI-only reporting detail: generated/unpaid EMI bills never count as paid.
+    const paidEmi = round2(entries.reduce((sum, entry) =>
+      entry.module === 'emi' && entry.entryType === 'expense' && entry.financialType === 'debt'
+        ? sum + Number(entry.amountTotal || 0) : sum, 0));
+    const totalIncome = budget.income;
+    const totalLiving = budget.living;
+    const totalDebt = budget.debt;
+    const totalLedgerInvestment = budget.components.ledgerInvestment;
+    const savingsContribution = budget.components.savingsContribution;
     const totalSavingsAsset = sv2.totalAsset;
-
-    /* ===========================================
-       5️⃣ DISPOSABLE CALCULATION
-    =========================================== */
-
-    // investment for the month = ledger investment + savings contributions
-    const totalInvestment = round2(totalLedgerInvestment + savingsContribution);
-
-    const available = round2(totalIncome - totalLiving - totalDebt);
-    const finalBalance = round2(available - totalInvestment);
-
-    const savingsRate = totalIncome > 0 ? round2((totalInvestment / totalIncome) * 100) : 0;
-
-    // legacy fields (keep so nothing else breaks)
+    const totalInvestment = budget.investment;
+    const available = budget.available;
+    const finalBalance = budget.finalBalance;
+    const savingsRate = budget.savingsRate;
     const legacyExpense = round2(totalLiving + totalDebt + totalLedgerInvestment);
     const legacyBalance = round2(totalIncome - legacyExpense);
-    const legacyDisposable = round2(totalIncome - legacyExpense - savingsContribution);
+    const legacyDisposable = round2(legacyBalance - savingsContribution);
+
+    // Same read-only account reconciliation and month-only cash arithmetic as Wallet.
+    // No bills, settlements or synthetic budget rows are booked as cash here.
+    const [reconciled, accountsForFlow, monthTransactions] = await Promise.all([
+      loadReconciledMonth(req.familyId, month),
+      Account.find({ familyId: req.familyId }).select("_id type owner name").lean(),
+      Transaction.find({ familyId: req.familyId, month })
+        .select("_id txType amount sourceType fromAccountId toAccountId paymentMode paymentParts").lean(),
+    ]);
+    const monthlyCashFlow = calculateMonthlyLiquidFlow(accountsForFlow, monthTransactions);
+    const recordedCash = summarizeLiquidBalances(reconciled.closing.accounts);
+    const cashWarnings = [...(monthlyCashFlow.issues || []), ...(reconciled.issues || [])];
+    const negativeLiquidAccounts = recordedCash.accounts.filter((account) => Number(account.balance) < 0)
+      .map((account) => ({ name: account.name, owner: account.owner, balance: account.balance }));
 
     /* ===========================================
        6️⃣ SPLIT + SETTLEMENT LOGIC
@@ -194,38 +188,18 @@ router.get("/summary", requireAuth, requireFamily, async (req, res) => {
       ledgerEntryId: { $in: entryIds },
     });
 
-    const splitByEntry = {};
-    for (const s of splits) {
-      const key = String(s.ledgerEntryId);
-      if (!splitByEntry[key]) splitByEntry[key] = [];
-      splitByEntry[key].push(s);
-    }
+    const linkedTransactionIds = entries
+      .filter((entry) => entry.entryType === "expense" && entry.sourceType === "transaction" && entry.sourceId)
+      .map((entry) => entry.sourceId);
+    const fundingTransactions = linkedTransactionIds.length
+      ? await Transaction.find({ familyId: req.familyId, _id: { $in: linkedTransactionIds }, txType: "expense" })
+        .select("_id txType amount paidByUserId paymentMode paymentParts settlementImpact")
+        .lean()
+      : [];
 
-    let paidMap = {};
-    let shareMap = {};
-
-    for (const u of users) {
-      paidMap[String(u._id)] = 0;
-      shareMap[String(u._id)] = 0;
-    }
-
-    for (const e of entries) {
-      // Settlement applies only to ordinary expense-sharing entries. Managed
-      // EMI/shared-purchase plans settle through their own payment flows.
-      if (e.entryType !== "expense" || e.affectsSettlement === false) continue;
-
-      const entrySplits = splitByEntry[String(e._id)] || [];
-
-      // Who should bear the cost
-      for (const s of entrySplits) {
-        shareMap[String(s.userId)] += Number(s.shareAmount || 0);
-      }
-
-      // Who actually paid
-      if (e.paidByUserId) {
-        paidMap[String(e.paidByUserId)] += Number(e.amountTotal || 0);
-      }
-    }
+    const { paidMap, shareMap, balanced, settlementDiscrepancy } = calculateOrdinaryExpenseShares({
+      entries: budgetView.regularEntries, splits, transactions: fundingTransactions, userIds: users.map((user) => user._id),
+    });
 
     const settlement = users.map((u) => {
       const net = round2(
@@ -247,6 +221,8 @@ router.get("/summary", requireAuth, requireFamily, async (req, res) => {
     res.json({
       ok: true,
       data: {
+        // This is monthly BUDGET allocation. Actual account cash is in Wallet.
+        budgetAllocation: budgetView.summary,
         // ✅ v2 summary (new dashboard brain)
         summary: {
           income: totalIncome,
@@ -256,10 +232,7 @@ router.get("/summary", requireAuth, requireFamily, async (req, res) => {
           available,
           finalBalance,
           savingsRate,
-          components: {
-            ledgerInvestment: totalLedgerInvestment,
-            savingsContribution,
-          },
+          components: { ...budget.components, paidEmi },
         },
 
         // 🧯 legacy (for old UI pieces / other pages)
@@ -271,7 +244,26 @@ router.get("/summary", requireAuth, requireFamily, async (req, res) => {
           disposable: legacyDisposable,
         },
         totalSavingsAsset,
+        cash: {
+          monthRemaining: monthlyCashFlow.household.remainingFromMonth,
+          incomeReceived: monthlyCashFlow.household.income,
+          paidExpenses: monthlyCashFlow.household.expenses,
+          // Actual recorded account debits, never a scheduled or unpaid bill.
+          emiPaid: monthlyCashFlow.household.emiPaid,
+          otherExpenses: monthlyCashFlow.household.otherExpenses,
+          sharedPurchasePaidUpfront: monthlyCashFlow.household.sharedPurchasePaidUpfront,
+          cardRepayments: monthlyCashFlow.household.cardRepayments,
+          savingsDeposited: monthlyCashFlow.household.savedOrInvested,
+          savingsWithdrawn: monthlyCashFlow.household.savingsWithdrawn,
+          recordedLiquidBalance: recordedCash.total,
+          negativeLiquidAccounts,
+          warningCount: cashWarnings.length,
+          closed: reconciled.closed,
+          staleClosedCount: reconciled.staleClosedCount,
+          source: "recorded_transactions",
+        },
         settlement,
+        settlementIntegrity: { balanced, discrepancy: settlementDiscrepancy },
       },
     });
   } catch (err) {
@@ -282,12 +274,13 @@ router.get("/summary", requireAuth, requireFamily, async (req, res) => {
 
 router.get("/trend", requireAuth, requireFamily, async (req, res) => {
   try {
-    await cleanupPendingInstallmentLedgers(req.familyId);
 
-    const now = new Date();
+    const selectedMonth = String(req.query.month || "");
+    const selected = parseMonth(selectedMonth);
+    const now = selected ? new Date(selected.y, selected.m - 1, 1) : new Date();
     const months = [];
 
-    for (let i = 5; i >= 0; i--) {
+    for (let i = 11; i >= 0; i--) {
       const d = new Date(now.getFullYear(), now.getMonth() - i, 1);
       const m = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}`;
       months.push(m);
@@ -296,35 +289,19 @@ router.get("/trend", requireAuth, requireFamily, async (req, res) => {
     const result = [];
 
     for (const m of months) {
-      const entries = await LedgerEntry.find({ familyId: req.familyId, month: m });
+      const persistedEntries = await LedgerEntry.find({ familyId: req.familyId, month: m });
+      const { entries, summary: budgetAllocation } = await loadSharedBudgetMonth(req.familyId, m, persistedEntries);
       const sv2 = await computeSavingsV2(req.familyId, m);
 
-      let income = 0;
-      let living = 0;
-      let debt = 0;
-      let ledgerInvestment = 0;
-
-      for (const e of entries) {
-        const amt = Number(e.amountTotal || 0);
-        const ft = e.financialType || (e.entryType === "income" ? "income" : "living");
-
-        if (ft === "income") income += amt;
-        else if (ft === "living") living += amt;
-        else if (ft === "debt") debt += amt;
-        else if (ft === "investment") ledgerInvestment += amt;
-      }
-
-      const savingsContribution = sv2.monthNet;
-      const investment = ledgerInvestment + savingsContribution;
-      const available = income - living - debt;
-      const finalBalance = available - investment;
-      const savingsRate = income > 0 ? (investment / income) * 100 : 0;
+      const budget = summarizeDashboardBudget({ entries, savingsContribution: sv2.monthNet });
+      const { income, living, debt, investment, available, finalBalance, savingsRate } = budget;
 
       // legacy
-      const expense = living + debt + ledgerInvestment;
+      const expense = living + debt + budget.components.ledgerInvestment;
 
       result.push({
         month: m,
+        scheduledLargePurchaseAllocation: budgetAllocation.scheduledLargePurchaseAllocation,
         income: round2(income),
         living: round2(living),
         debt: round2(debt),
@@ -334,7 +311,9 @@ router.get("/trend", requireAuth, requireFamily, async (req, res) => {
         savingsRate: round2(savingsRate),
         // legacy keys for older charts
         expense: round2(expense),
-        savings: round2(savingsContribution),
+        savings: round2(sv2.monthNet),
+        regularDebt: budget.components.regularDebt,
+        scheduledPurchases: budget.components.scheduledLargePurchaseAllocation,
       });
     }
 

@@ -12,6 +12,10 @@ import Split from "../models/Split.js";
 import FamilyMember from "../models/FamilyMember.js";
 
 import { splitEqual, splitPersonal, splitRatio, splitFixed } from "../utils/splitCalc.js";
+import { assertExpenseSplit, validMonth } from "../utils/postingRules.js";
+import { verifyExpensePosting, requireOpenMonth } from "../utils/postingPreflight.js";
+import { runAtomicPosting } from "../utils/financialPostingTransaction.js";
+import { postingError } from "../utils/postingRules.js";
 
 const router = Router();
 
@@ -76,7 +80,7 @@ async function buildSplitRows({ familyId, template, amount }) {
     throw new Error("Invalid split config");
   }
 
-  return splitRows;
+  return assertExpenseSplit(splitRows, amount, userIds);
 }
 
 async function createLedgerForFixed({
@@ -289,8 +293,8 @@ router.delete("/templates/:id", requireAuth, requireFamily, async (req, res) => 
 router.post("/templates/:id/add", requireAuth, requireFamily, async (req, res) => {
   const { month, paidByUserId, fromAccountId, paymentDate, amount, note } = req.body || {};
 
-  if (!month) {
-    return res.status(400).json({ ok: false, message: "month required (YYYY-MM)" });
+  if (!validMonth(month)) {
+    return res.status(400).json({ ok: false, message: "Valid month required (YYYY-MM)" });
   }
 
   if (!paidByUserId) {
@@ -334,18 +338,32 @@ router.post("/templates/:id/add", requireAuth, requireFamily, async (req, res) =
   }
 
   const date = normalizeDate(paymentDate, month);
+  if (toMonthString(date) !== month) {
+    return res.status(400).json({ ok: false, message: "Payment date must be within the selected month" });
+  }
+  try {
+    await requireOpenMonth(req.familyId, month);
+    await verifyExpensePosting({ familyId: req.familyId, date, amount: finalAmount,
+      paidByUserId, fromAccountId, categoryId: template.categoryId });
+  } catch (error) {
+    return res.status(error.status || 400).json({ ok: false, message: error.message });
+  }
 
-  const inst = await createPostedInstance({
-    familyId: req.familyId,
-    template,
-    month,
-    date,
-    amount: finalAmount,
-    paidByUserId,
-    fromAccountId,
-    note: note || "",
-    createdByUserId: req.user.userId,
-  });
+  let inst;
+  try {
+    inst = await runAtomicPosting(async () => {
+      // Recheck inside the same transaction that creates all linked records.
+      const duplicate = await FixedInstance.exists({ familyId: req.familyId, templateId: template._id, month });
+      if (duplicate) throw postingError("This template already exists for the selected month", 409);
+      await requireOpenMonth(req.familyId, month);
+      return createPostedInstance({
+        familyId: req.familyId, template, month, date, amount: finalAmount,
+        paidByUserId, fromAccountId, note: note || "", createdByUserId: req.user.userId,
+      });
+    });
+  } catch (error) {
+    return res.status(error.status || 500).json({ ok: false, message: error.message || "Fixed expense posting failed" });
+  }
 
   const populated = await FixedInstance.findById(inst._id)
     .populate("templateId")
@@ -378,9 +396,11 @@ router.get("/instances", requireAuth, requireFamily, async (req, res) => {
 // Optional bulk month generation: now only creates pending instances
 router.post("/generate", requireAuth, requireFamily, async (req, res) => {
   const { month } = req.body || {};
-  if (!month) {
-    return res.status(400).json({ ok: false, message: "month required (YYYY-MM)" });
+  if (!validMonth(month)) {
+    return res.status(400).json({ ok: false, message: "Valid month required (YYYY-MM)" });
   }
+  try { await requireOpenMonth(req.familyId, month); }
+  catch (error) { return res.status(error.status || 400).json({ ok: false, message: error.message }); }
 
   const templates = await FixedTemplate.find({
     familyId: req.familyId,
@@ -456,58 +476,81 @@ router.post("/instances/:id/post", requireAuth, requireFamily, async (req, res) 
   }
 
   const date = paymentDate ? new Date(paymentDate) : inst.date;
+  if (!Number.isFinite(date?.getTime?.()) || toMonthString(date) !== inst.month) {
+    return res.status(400).json({ ok: false, message: "Payment date must be within the selected instance month" });
+  }
+  try {
+    await requireOpenMonth(req.familyId, inst.month);
+    await verifyExpensePosting({ familyId: req.familyId, date, amount: finalAmount,
+      paidByUserId, fromAccountId, categoryId: template.categoryId });
+  } catch (error) {
+    return res.status(error.status || 400).json({ ok: false, message: error.message });
+  }
 
-  const txId = new mongoose.Types.ObjectId();
-  const txMonth = toMonthString(date);
+  try {
+    await runAtomicPosting(async () => {
+      const currentInstance = await FixedInstance.findOne({ _id: inst._id, familyId: req.familyId });
+      if (!currentInstance || currentInstance.status !== "pending" || currentInstance.transactionId || currentInstance.ledgerEntryId) {
+        throw postingError("This fixed expense is already posted or has linked records; refresh the list", 409);
+      }
+      const instance = currentInstance;
+      await requireOpenMonth(req.familyId, instance.month);
+      const txId = new mongoose.Types.ObjectId();
+      const txMonth = toMonthString(date);
 
-  const splitRows = await buildSplitRows({
-    familyId: req.familyId,
-    template,
-    amount: finalAmount,
-  });
+      const splitRows = await buildSplitRows({
+        familyId: req.familyId,
+        template,
+        amount: finalAmount,
+      });
 
-  const finalNote = note?.trim()
-    ? `Fixed: ${template.name} — ${note.trim()}`
-    : `Fixed: ${template.name}`;
+      const finalNote = note?.trim()
+        ? `Fixed: ${template.name} — ${note.trim()}`
+        : `Fixed: ${template.name}`;
 
-  const entry = await createLedgerForFixed({
-    familyId: req.familyId,
-    txId,
-    date,
-    month: txMonth,
-    categoryId: template.categoryId,
-    amount: finalAmount,
-    paidByUserId,
-    note: finalNote,
-    createdByUserId: req.user.userId,
-    splitRows,
-  });
+      const entry = await createLedgerForFixed({
+        familyId: req.familyId,
+        txId,
+        date,
+        month: txMonth,
+        categoryId: template.categoryId,
+        amount: finalAmount,
+        paidByUserId,
+        note: finalNote,
+        createdByUserId: req.user.userId,
+        splitRows,
+      });
 
-  const tx = await Transaction.create({
-    _id: txId,
-    familyId: req.familyId,
-    txType: "expense",
-    date,
-    month: txMonth,
-    categoryId: template.categoryId,
-    amount: finalAmount,
-    note: finalNote,
-    fromAccountId,
-    toAccountId: null,
-    paidByUserId,
-    receivedByUserId: null,
-    createdByUserId: req.user.userId,
-  });
+      const tx = await Transaction.create({
+        _id: txId,
+        familyId: req.familyId,
+        txType: "expense",
+        date,
+        month: txMonth,
+        categoryId: template.categoryId,
+        amount: finalAmount,
+        note: finalNote,
+        fromAccountId,
+        toAccountId: null,
+        paidByUserId,
+        receivedByUserId: null,
+        createdByUserId: req.user.userId,
+      });
 
-  inst.amount = finalAmount;
-  inst.note = note?.trim() || "";
-  inst.date = date;
-  inst.paidByUserId = paidByUserId;
-  inst.fromAccountId = fromAccountId;
-  inst.ledgerEntryId = entry._id;
-  inst.transactionId = tx._id;
-  inst.status = "posted";
-  await inst.save();
+      instance.amount = finalAmount;
+      instance.note = note?.trim() || "";
+      instance.date = date;
+      instance.paidByUserId = paidByUserId;
+      instance.fromAccountId = fromAccountId;
+      instance.ledgerEntryId = entry._id;
+      instance.transactionId = tx._id;
+      instance.status = "posted";
+      await instance.save();
+
+    });
+  } catch (error) {
+    return res.status(error.status || 500).json({ ok: false, message: error.message || "Fixed expense posting failed" });
+  }
 
   const populated = await FixedInstance.findById(inst._id)
     .populate("templateId")
@@ -544,6 +587,9 @@ router.put("/instances/:id", requireAuth, requireFamily, async (req, res) => {
 
   const date = normalizeDate(paymentDate, selectedMonth || inst.month);
   const txMonth = toMonthString(date);
+  if (selectedMonth && selectedMonth !== txMonth) {
+    return res.status(400).json({ ok: false, message: "Payment date must be within the selected month" });
+  }
 
   const finalAmount = Number(
     amount !== undefined && amount !== null && amount !== ""
@@ -555,6 +601,18 @@ router.put("/instances/:id", requireAuth, requireFamily, async (req, res) => {
     return res.status(400).json({ ok: false, message: "Amount must be > 0" });
   }
 
+  try {
+    await requireOpenMonth(req.familyId, inst.month);
+    if (inst.transactionId) {
+      const original = await Transaction.findOne({ _id: inst.transactionId, familyId: req.familyId }).select('month').lean();
+      if (original?.month && original.month !== inst.month) await requireOpenMonth(req.familyId, original.month);
+    }
+    await verifyExpensePosting({ familyId: req.familyId, date, amount: finalAmount,
+      paidByUserId, fromAccountId, categoryId: template.categoryId });
+  } catch (error) {
+    return res.status(error.status || 400).json({ ok: false, message: error.message });
+  }
+
   const cleanNote = String(note || "").trim();
   const finalNote = cleanNote ? `Fixed: ${template.name} — ${cleanNote}` : `Fixed: ${template.name}`;
 
@@ -564,114 +622,130 @@ router.put("/instances/:id", requireAuth, requireFamily, async (req, res) => {
     amount: finalAmount,
   });
 
-  let tx = null;
+  try {
+    await runAtomicPosting(async () => {
+      const inst = await FixedInstance.findOne({ _id: req.params.id, familyId: req.familyId });
+      if (!inst) throw postingError("Fixed expense no longer exists", 409);
+      await requireOpenMonth(req.familyId, inst.month);
+      const linked = inst.transactionId ? await Transaction.findOne({ _id: inst.transactionId, familyId: req.familyId }) : null;
+      if (linked?.month) await requireOpenMonth(req.familyId, linked.month);
+      await requireOpenMonth(req.familyId, txMonth);
+      let tx = null;
 
-  if (inst.transactionId) {
-    tx = await Transaction.findOne({ _id: inst.transactionId, familyId: req.familyId });
-  }
+      if (inst.transactionId) {
+        tx = await Transaction.findOne({ _id: inst.transactionId, familyId: req.familyId });
+      }
 
-  if (!tx) {
-    const txId = normalizeId(inst.transactionId) || new mongoose.Types.ObjectId();
+      if (!tx) {
+        const txId = normalizeId(inst.transactionId) || new mongoose.Types.ObjectId();
 
-    tx = await Transaction.create({
-      _id: txId,
-      familyId: req.familyId,
-      txType: "expense",
-      date,
-      month: txMonth,
-      categoryId: template.categoryId,
-      amount: finalAmount,
-      note: finalNote,
-      fromAccountId,
-      toAccountId: null,
-      paidByUserId,
-      receivedByUserId: null,
-      createdByUserId: req.user.userId,
-    });
+        tx = await Transaction.create({
+          _id: txId,
+          familyId: req.familyId,
+          txType: "expense",
+          date,
+          month: txMonth,
+          categoryId: template.categoryId,
+          amount: finalAmount,
+          note: finalNote,
+          fromAccountId,
+          toAccountId: null,
+          paidByUserId,
+          receivedByUserId: null,
+          createdByUserId: req.user.userId,
+        });
 
-    inst.transactionId = tx._id;
-  } else {
-    tx.txType = "expense";
-    tx.date = date;
-    tx.month = txMonth;
-    tx.categoryId = template.categoryId;
-    tx.amount = finalAmount;
-    tx.note = finalNote;
-    tx.fromAccountId = fromAccountId;
-    tx.toAccountId = null;
-    tx.paidByUserId = paidByUserId;
-    tx.receivedByUserId = null;
-    await tx.save();
-  }
+        inst.transactionId = tx._id;
+      } else {
+        tx.txType = "expense";
+        tx.date = date;
+        tx.month = txMonth;
+        tx.categoryId = template.categoryId;
+        tx.amount = finalAmount;
+        tx.note = finalNote;
+        tx.fromAccountId = fromAccountId;
+        tx.toAccountId = null;
+        tx.paidByUserId = paidByUserId;
+        tx.receivedByUserId = null;
+        await tx.save();
+      }
 
-  const financialType = await getExpenseFinancialType({
-    familyId: req.familyId,
-    categoryId: template.categoryId,
-  });
-
-  let entry = null;
-
-  if (inst.ledgerEntryId) {
-    entry = await LedgerEntry.findOne({ _id: inst.ledgerEntryId, familyId: req.familyId });
-  }
-
-  if (!entry && tx?._id) {
-    entry = await LedgerEntry.findOne({
-      familyId: req.familyId,
-      sourceType: "transaction",
-      sourceId: tx._id,
-    });
-  }
-
-  if (!entry) {
-    entry = await createLedgerForFixed({
-      familyId: req.familyId,
-      txId: tx._id,
-      date,
-      month: txMonth,
-      categoryId: template.categoryId,
-      amount: finalAmount,
-      paidByUserId,
-      note: finalNote,
-      createdByUserId: req.user.userId,
-      splitRows,
-    });
-  } else {
-    entry.entryType = "expense";
-    entry.financialType = financialType;
-    entry.module = "fixed";
-    entry.date = date;
-    entry.month = txMonth;
-    entry.categoryId = template.categoryId;
-    entry.amountTotal = finalAmount;
-    entry.paidByUserId = paidByUserId;
-    entry.receivedByUserId = null;
-    entry.note = finalNote;
-    entry.sourceType = "transaction";
-    entry.sourceId = tx._id;
-    await entry.save();
-
-    await Split.deleteMany({ familyId: req.familyId, ledgerEntryId: entry._id });
-    await Split.insertMany(
-      splitRows.map((r) => ({
+      const financialType = await getExpenseFinancialType({
         familyId: req.familyId,
-        ledgerEntryId: entry._id,
-        userId: r.userId,
-        shareAmount: r.shareAmount,
-      }))
-    );
-  }
+        categoryId: template.categoryId,
+      });
 
-  inst.amount = finalAmount;
-  inst.note = cleanNote;
-  inst.date = date;
-  inst.month = selectedMonth || inst.month;
-  inst.paidByUserId = paidByUserId;
-  inst.fromAccountId = fromAccountId;
-  inst.ledgerEntryId = entry._id;
-  inst.transactionId = tx._id;
-  inst.status = "posted";
-  await inst.save();
+      let entry = null;
+
+      if (inst.ledgerEntryId) {
+        entry = await LedgerEntry.findOne({ _id: inst.ledgerEntryId, familyId: req.familyId });
+      }
+
+      if (!entry && tx?._id) {
+        entry = await LedgerEntry.findOne({
+          familyId: req.familyId,
+          sourceType: "transaction",
+          sourceId: tx._id,
+        });
+      }
+
+      if (entry && (entry.sourceType !== "transaction" || String(entry.sourceId) !== String(tx._id))) {
+        throw postingError("Fixed expense ledger linkage is inconsistent; resolve before editing", 409);
+      }
+      if (!entry) {
+        entry = await createLedgerForFixed({
+          familyId: req.familyId,
+          txId: tx._id,
+          date,
+          month: txMonth,
+          categoryId: template.categoryId,
+          amount: finalAmount,
+          paidByUserId,
+          note: finalNote,
+          createdByUserId: req.user.userId,
+          splitRows,
+        });
+      } else {
+        entry.entryType = "expense";
+        entry.financialType = financialType;
+        entry.module = "fixed";
+        entry.date = date;
+        entry.month = txMonth;
+        entry.categoryId = template.categoryId;
+        entry.amountTotal = finalAmount;
+        entry.paidByUserId = paidByUserId;
+        entry.receivedByUserId = null;
+        entry.note = finalNote;
+        entry.sourceType = "transaction";
+        entry.sourceId = tx._id;
+        await entry.save();
+
+        await Split.deleteMany({ familyId: req.familyId, ledgerEntryId: entry._id });
+        await Split.insertMany(
+          splitRows.map((r) => ({
+            familyId: req.familyId,
+            ledgerEntryId: entry._id,
+            userId: r.userId,
+            shareAmount: r.shareAmount,
+          }))
+        );
+      }
+
+      inst.amount = finalAmount;
+      inst.note = cleanNote;
+      inst.date = date;
+      inst.month = selectedMonth || inst.month;
+      inst.paidByUserId = paidByUserId;
+      inst.fromAccountId = fromAccountId;
+      inst.ledgerEntryId = entry._id;
+      inst.transactionId = tx._id;
+      inst.status = "posted";
+      await inst.save();
+
+    });
+  } catch (error) {
+    return res.status(error.status || 500).json({ ok: false, message: error.message || "Fixed expense update failed" });
+  }
 
   const populated = await FixedInstance.findById(inst._id)
     .populate("templateId")
@@ -689,22 +763,44 @@ router.delete("/instances/:id", requireAuth, requireFamily, async (req, res) => 
   });
 
   if (!inst) return res.status(404).json({ ok: false, message: "Not found" });
-
-  if (inst.transactionId) {
-    await Transaction.deleteOne({ _id: inst.transactionId, familyId: req.familyId });
-
-    const le = await LedgerEntry.findOneAndDelete({
-      familyId: req.familyId,
-      sourceType: "transaction",
-      sourceId: inst.transactionId,
-    }).select("_id");
-
-    if (le?._id) {
-      await Split.deleteMany({ familyId: req.familyId, ledgerEntryId: le._id });
+  try {
+    await requireOpenMonth(req.familyId, inst.month);
+    if (inst.transactionId) {
+      const linked = await Transaction.findOne({ _id: inst.transactionId, familyId: req.familyId }).select('month').lean();
+      if (linked?.month && linked.month !== inst.month) await requireOpenMonth(req.familyId, linked.month);
     }
+  } catch (error) {
+    return res.status(error.status || 400).json({ ok: false, message: error.message });
   }
 
-  await FixedInstance.deleteOne({ _id: inst._id });
+  try {
+    await runAtomicPosting(async () => {
+      const existing = await FixedInstance.findOne({ _id: req.params.id, familyId: req.familyId });
+      if (!existing) throw postingError("Fixed expense no longer exists",409);
+      await requireOpenMonth(req.familyId, existing.month);
+      if (existing.ledgerEntryId && !existing.transactionId) {
+        throw postingError("Fixed expense Ledger entry has no matching transaction; inspect before deleting", 409);
+      }
+      if (existing.transactionId) {
+        const tx = await Transaction.findOne({ _id: existing.transactionId, familyId: req.familyId });
+        if (tx?.month) await requireOpenMonth(req.familyId, tx.month);
+        if (!tx) throw postingError("Fixed expense references a missing cash transaction; inspect before deleting", 409);
+        const entries = await LedgerEntry.find({ familyId: req.familyId, sourceType: "transaction", sourceId: existing.transactionId });
+        if (entries.length > 1) throw postingError("Duplicate ledger entries detected; resolve before deleting",409);
+        if (existing.ledgerEntryId && (!entries.length || String(entries[0]._id) !== String(existing.ledgerEntryId))) {
+          throw postingError("Fixed expense has inconsistent Ledger linkage; inspect before deleting", 409);
+        }
+        if (entries.length) {
+          await Split.deleteMany({ familyId: req.familyId, ledgerEntryId: entries[0]._id });
+          await LedgerEntry.deleteOne({ _id: entries[0]._id, familyId: req.familyId });
+        }
+        if (tx) await Transaction.deleteOne({ _id: tx._id, familyId: req.familyId });
+      }
+      await FixedInstance.deleteOne({ _id: existing._id, familyId: req.familyId });
+    });
+  } catch (error) {
+    return res.status(error.status || 500).json({ ok: false, message: error.message || "Fixed expense delete failed" });
+  }
 
   res.json({ ok: true });
 });

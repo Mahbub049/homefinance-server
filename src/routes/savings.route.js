@@ -10,6 +10,10 @@ import FamilyMember from "../models/FamilyMember.js";
 import LedgerEntry from "../models/LedgerEntry.js";
 import Split from "../models/Split.js";
 import User from "../models/User.js";
+import { verifySavingsPosting } from '../utils/postingPreflight.js';
+import { positiveMoney } from '../utils/postingRules.js';
+import { requireOpenMonth } from '../utils/postingPreflight.js';
+import { existingFinancialPosting, createIdempotentFinancialPosting } from '../utils/idempotentFinancialPosting.js';
 
 const router = Router();
 
@@ -48,15 +52,6 @@ function lastMonths(endMonth, count = 12) {
   }
 
   return months.filter(Boolean);
-}
-
-function ownerFromMemberName(name) {
-  const n = String(name || "").trim().toLowerCase();
-
-  if (n.includes("mahbub")) return "Mahbub";
-  if (n.includes("mirza")) return "Mirza";
-
-  return "";
 }
 
 function round2(value) {
@@ -194,10 +189,11 @@ router.get("/overview", requireAuth, requireFamily, async (req, res) => {
             $group: {
               _id: null,
               deposited: {
-                $sum: { $cond: ["$toSavings", "$amount", 0] },
+                // Savings → Savings is an internal move, NOT new saving.
+                $sum: { $cond: [{ $and: ["$toSavings", { $not: ["$fromSavings"] }] }, "$amount", 0] },
               },
               withdrawn: {
-                $sum: { $cond: ["$fromSavings", "$amount", 0] },
+                $sum: { $cond: [{ $and: ["$fromSavings", { $not: ["$toSavings"] }] }, "$amount", 0] },
               },
             },
           },
@@ -594,6 +590,12 @@ router.get("/yearly-summary", requireAuth, requireFamily, async (req, res) => {
 // Manual deposit as a transfer
 router.post("/deposit", requireAuth, requireFamily, async (req, res) => {
   try {
+    const replay = await existingFinancialPosting(req, 'savings.deposit');
+    if (replay) {
+      const item = await Transaction.findOne({ _id: replay.resultId, familyId: req.familyId });
+      if (!item) return res.status(409).json({ ok: false, message: 'This deposit was already recorded, but its transaction was later removed. Review transaction history.' });
+      return res.status(200).json({ ok: true, item, replayed: true });
+    }
     const {
       paidByUserId,
       date,
@@ -619,12 +621,8 @@ router.post("/deposit", requireAuth, requireFamily, async (req, res) => {
 
     const amt = Number(amount);
 
-    if (!amt || amt <= 0) {
-      return res.status(400).json({
-        ok: false,
-        message: "Amount must be > 0",
-      });
-    }
+    try { positiveMoney(amt, 'Deposit'); }
+    catch (error) { return res.status(error.status || 400).json({ ok: false, message: error.message }); }
 
     if (!fromAccountId || !toAccountId) {
       return res.status(400).json({
@@ -674,35 +672,24 @@ router.post("/deposit", requireAuth, requireFamily, async (req, res) => {
       });
     }
 
-    if (paidByUserId) {
-      const payerMember = await FamilyMember.findOne({
-        familyId: req.familyId,
-        userId: paidByUserId,
-      }).populate("userId", "name");
-
-      if (!payerMember) {
-        return res.status(400).json({
-          ok: false,
-          message: "Selected user is not a valid family member",
-        });
-      }
-
-      const payerOwner = ownerFromMemberName(payerMember?.userId?.name);
-
-      if (
-        payerOwner &&
-        (fromAcc.owner !== payerOwner || toAcc.owner !== payerOwner)
-      ) {
-        return res.status(400).json({
-          ok: false,
-          message: "Selected accounts must belong to the selected user",
-        });
-      }
+    // The original transfer is the only financial record: never add an expense
+    // Ledger row or a second savings transaction for this same deposit.
+    try {
+      await verifySavingsPosting({ familyId: req.familyId, date: d, paidByUserId,
+        fromAccountId, toAccountId, amount: amt });
+    } catch (error) {
+      return res.status(error.status || 400).json({ ok: false, message: error.message });
     }
 
-    const item = await Transaction.create({
+    const result = await createIdempotentFinancialPosting(req, 'savings.deposit', async () => {
+      await requireOpenMonth(req.familyId, month);
+      const item = await Transaction.create({
       familyId: req.familyId,
       txType: "transfer",
+      budgetImpact: false,
+      ledgerEligible: false,
+      settlementImpact: false,
+      sourceType: 'savings_deposit',
       date: d,
       month,
       categoryId: null,
@@ -713,14 +700,14 @@ router.post("/deposit", requireAuth, requireFamily, async (req, res) => {
       paidByUserId: paidByUserId || null,
       receivedByUserId: null,
       createdByUserId: req.user.userId,
+      });
+      return item._id;
     });
-
-    res.status(201).json({
-      ok: true,
-      item,
-    });
+    const item = await Transaction.findOne({ _id: result.resultId, familyId: req.familyId });
+    if (!item) throw new Error('Deposit was saved but could not be loaded; please refresh');
+    res.status(result.replayed ? 200 : 201).json({ ok: true, item, replayed: result.replayed });
   } catch (e) {
-    res.status(500).json({
+    res.status(e?.status || 500).json({
       ok: false,
       message: e?.message || "Deposit failed",
     });

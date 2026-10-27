@@ -5,13 +5,25 @@ import { requireFamily } from "../middlewares/familyGuard.js";
 
 import SharedPurchase from "../models/SharedPurchase.js";
 import SharedPurchaseInstallment from "../models/SharedPurchaseInstallment.js";
+import MonthlyBalance from "../models/MonthlyBalance.js";
 import FamilyMember from "../models/FamilyMember.js";
 import Account from "../models/Account.js";
 import Category from "../models/Category.js";
 import Transaction from "../models/Transaction.js";
 import LedgerEntry from "../models/LedgerEntry.js";
 import Split from "../models/Split.js";
-import { cleanupPendingInstallmentLedgers } from "../utils/installmentLedger.js";
+import { requireOpenMonth } from "../utils/postingPreflight.js";
+import { positiveMoney } from "../utils/postingRules.js";
+import { createIdempotentFinancialPosting } from "../utils/idempotentFinancialPosting.js";
+import { runAtomicPosting, atomicPostingError } from "../utils/financialPostingTransaction.js";
+import { validReimbursement } from "../utils/sharedPurchaseSchedule.js";
+import {
+  ensureEditablePurchaseMonth, requireLiquidPurchaseAccount,
+  requirePendingInstallmentForPayment, requireSafePlanRemoval,
+  requireLinkedDocument, purchaseWriteError,
+} from "../utils/sharedPurchaseSafety.js";
+import { summarizePurchaseInstallments } from "../utils/sharedPurchaseSchedule.js";
+import { summarizeAllocationProgress } from "../utils/purchaseAllocationProgress.js";
 
 const router = Router();
 
@@ -33,6 +45,15 @@ function addMonths(yyyyMm, add) {
   const [year, month] = yyyyMm.split("-").map(Number);
   const d = new Date(year, month - 1 + add, 1);
   return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}`;
+}
+
+async function requireOpenPurchaseMonths(familyId, months) {
+  const unique = [...new Set(months.map((month) => ensureEditablePurchaseMonth(month)))];
+  const closed = await MonthlyBalance.findOne({
+    familyId, month: { $in: unique },
+    $or: [{ closedAt: { $ne: null } }, { closingBalance: { $ne: null } }],
+  }).select('month').lean();
+  if (closed) throw purchaseWriteError(`Month ${closed.month} is already closed. No purchase records were changed.`, 409);
 }
 
 function dueDateForMonth(yyyyMm, preferredDay) {
@@ -237,8 +258,8 @@ router.get("/", requireAuth, requireFamily, async (req, res) => {
   try {
     const month = validMonth(req.query.month) ? String(req.query.month) : monthKey(new Date());
 
-    await cleanupPendingInstallmentLedgers(req.familyId, month);
-
+    // Reading purchases MUST NOT clean up or modify old installments/Ledger rows.
+    // Legacy inconsistencies are reported by the existing read-model flags.
     const plans = await SharedPurchase.find({ familyId: req.familyId })
       .sort({ createdAt: -1 })
       .populate("payerUserId", "name email")
@@ -267,72 +288,75 @@ router.get("/", requireAuth, requireFamily, async (req, res) => {
       installmentMap.get(key).push(installment);
     }
 
-    let totalOutstanding = 0;
-    let totalReceivable = 0;
-    let monthAllocation = 0;
-    let monthDue = 0;
-    let monthReceived = 0;
+    // Verify linked bank/account transfers before marking any installment paid
+    // in the read model. A stale "paid" flag must not erase an obligation.
+    const paymentTransactionIds = allInstallments
+      .filter((row) => row.paymentRequired && row.paymentTransactionId)
+      .map((row) => row.paymentTransactionId);
+    const paymentTransactions = paymentTransactionIds.length
+      ? await Transaction.find({
+          familyId: req.familyId,
+          _id: { $in: paymentTransactionIds },
+          txType: "transfer",
+          sourceType: "shared_purchase_reimbursement",
+        }).select("_id txType sourceType sourceId amount paidByUserId receivedByUserId fromAccountId toAccountId").lean()
+      : [];
+    const paymentById = new Map(paymentTransactions.map((tx) => [String(tx._id), tx]));
 
+    const totals = {
+      totalReceivable: 0,
+      totalOutstanding: 0,
+      monthAllocation: 0,
+      monthDue: 0,
+      monthReceived: 0,
+      monthScheduledReimbursement: 0,
+      overdueBeforeMonth: 0,
+      dueThroughMonth: 0,
+      futureUnpaid: 0,
+      invalidPaymentRecords: 0,
+      pendingLedgerLinksToReview: 0,
+    };
     const enrichedPlans = plans.map((plan) => {
-      const installments = installmentMap.get(String(plan._id)) || [];
-      const paymentInstallments = installments.filter((row) => row.paymentRequired);
-      const paidInstallments = paymentInstallments.filter((row) => row.status === "paid");
-      const paidAmount = round2(
-        paidInstallments.reduce((sum, row) => sum + Number(row.amount || 0), 0)
+      const rawRows = installmentMap.get(String(plan._id)) || [];
+      const { summary: stats, installments } = summarizePurchaseInstallments(
+        rawRows, month, plan, paymentById
       );
-      const receivableTotal = round2(
-        paymentInstallments.reduce((sum, row) => sum + Number(row.amount || 0), 0)
-      );
-      const outstanding = round2(Math.max(0, receivableTotal - paidAmount));
-      const selectedMonthRows = installments.filter((row) => row.month === month);
+      totals.totalReceivable = round2(totals.totalReceivable + stats.receivableTotal);
+      totals.totalOutstanding = round2(totals.totalOutstanding + stats.outstandingAllSchedule);
+      totals.monthAllocation = round2(totals.monthAllocation + stats.scheduledAllocationThisMonth);
+      totals.monthDue = round2(totals.monthDue + stats.dueThisMonth);
+      totals.monthReceived = round2(totals.monthReceived + stats.receivedThisMonth);
+      totals.monthScheduledReimbursement = round2(totals.monthScheduledReimbursement + stats.scheduledReimbursementThisMonth);
+      totals.overdueBeforeMonth = round2(totals.overdueBeforeMonth + stats.overdueBeforeMonth);
+      totals.dueThroughMonth = round2(totals.dueThroughMonth + stats.dueThroughMonth);
+      totals.futureUnpaid = round2(totals.futureUnpaid + stats.futureUnpaid);
+      totals.invalidPaymentRecords += stats.invalidPaymentRecords;
+      // Report premature legacy ledger rows instead of deleting them on GET.
+      const pendingLedgerLinks = rawRows.filter((row) =>
+        row.paymentRequired && row.status !== 'paid' && row.ledgerEntryId
+      ).length;
+      totals.pendingLedgerLinksToReview += pendingLedgerLinks;
 
-      totalReceivable = round2(totalReceivable + receivableTotal);
-      totalOutstanding = round2(totalOutstanding + outstanding);
-      monthAllocation = round2(
-        monthAllocation +
-          selectedMonthRows.reduce((sum, row) => sum + Number(row.amount || 0), 0)
-      );
-      monthDue = round2(
-        monthDue +
-          selectedMonthRows
-            .filter((row) => row.paymentRequired && row.status !== "paid")
-            .reduce((sum, row) => sum + Number(row.amount || 0), 0)
-      );
-      monthReceived = round2(
-        monthReceived +
-          installments
-            .filter(
-              (row) =>
-                row.paymentRequired &&
-                row.status === "paid" &&
-                row.paidAt &&
-                monthKey(row.paidAt) === month
-            )
-            .reduce((sum, row) => sum + Number(row.amount || 0), 0)
-      );
-
-      const progress = receivableTotal > 0 ? round2((paidAmount / receivableTotal) * 100) : 100;
-      const effectiveStatus =
-        paymentInstallments.length === 0 && monthKey(new Date()) > plan.endMonth
-          ? "completed"
-          : plan.status;
-
+      // Read-only schedule progress; never treat allocations as repeated bank debits.
+      const allocationHistory = summarizeAllocationProgress(rawRows, month);
       return {
         ...plan,
-        status: effectiveStatus,
+        allocationHistory,
+        // Keep the persisted plan status untouched; a legacy payment may need
+        // reconciliation before "completed" is financially justified.
         stats: {
-          receivableTotal,
-          paidAmount,
-          outstanding,
-          paidCount: paidInstallments.length,
-          paymentCount: paymentInstallments.length,
-          progress,
+          ...stats,
+          pendingLedgerLinksToReview: pendingLedgerLinks,
+          paidAmount: stats.receivedLifetime,
+          outstanding: stats.outstandingAllSchedule,
+          // Plan-level "due to date" is separate from future repayments.
         },
-        monthInstallments: selectedMonthRows,
+        monthInstallments: installments.filter((row) => row.month === month),
+        overdueInstallments: installments.filter((row) => row.month < month && row.unpaidAsOfMonth),
       };
     });
 
-    const monthInstallments = allInstallments.filter((row) => row.month === month);
+    const monthInstallments = enrichedPlans.flatMap((plan) => plan.monthInstallments);
 
     res.json({
       ok: true,
@@ -340,11 +364,7 @@ router.get("/", requireAuth, requireFamily, async (req, res) => {
       plans: enrichedPlans,
       monthInstallments,
       summary: {
-        totalReceivable,
-        totalOutstanding,
-        monthAllocation,
-        monthDue,
-        monthReceived,
+        ...totals,
         activePlans: enrichedPlans.filter((plan) => plan.status === "active").length,
       },
     });
@@ -355,471 +375,340 @@ router.get("/", requireAuth, requireFamily, async (req, res) => {
 });
 
 router.post("/", requireAuth, requireFamily, async (req, res) => {
-  let purchase = null;
-  let upfrontTransaction = null;
-  const createdInstallmentIds = [];
-  const createdLedgerIds = [];
-
   try {
-    const {
-      title,
-      totalAmount,
-      purchaseDate,
-      categoryId,
-      payerUserId,
-      payerAccountId,
-      purchaseType = "shared",
-      startMonth,
-      months,
-      shares,
-      note,
-    } = req.body || {};
+    const result = await createIdempotentFinancialPosting(req, 'sharedPurchase.create', async () => {
+      const {
+        title, totalAmount, purchaseDate, categoryId, payerUserId, payerAccountId,
+        purchaseType = 'shared', startMonth, months, shares, note,
+      } = req.body || {};
+      const total = positiveMoney(totalAmount, 'Purchase total');
+      const duration = Number(months);
+      const date = new Date(purchaseDate);
+      if (!String(title || '').trim()) throw purchaseWriteError('Purchase title is required');
+      if (!purchaseDate || Number.isNaN(date.getTime())) throw purchaseWriteError('Valid purchase date is required');
+      if (!payerUserId || !payerAccountId) throw purchaseWriteError('Payer and payment account are required');
+      ensureEditablePurchaseMonth(startMonth);
+      const purchaseMonth = ensureEditablePurchaseMonth(monthKey(date));
+      if (!Number.isInteger(duration) || duration < 1 || duration > 120) throw purchaseWriteError('Months must be between 1 and 120');
+      if (!['personal', 'shared'].includes(purchaseType)) throw purchaseWriteError('Invalid purchase type');
 
-    const total = round2(totalAmount);
-    const duration = Number(months);
-    const date = new Date(purchaseDate);
+      // The upfront debit and every scheduled allocation are saved together.
+      await requireOpenPurchaseMonths(req.familyId, [
+        purchaseMonth, ...Array.from({ length: duration }, (_, index) => addMonths(startMonth, index)),
+      ]);
+      const account = requireLiquidPurchaseAccount(await Account.findOne({
+        _id: payerAccountId, familyId: req.familyId, isActive: { $ne: false },
+      }));
+      const normalizedShares = purchaseType === 'personal'
+        ? [{ userId: String(payerUserId), shareAmount: total }]
+        : Array.isArray(shares)
+          ? shares.map((row) => ({
+              userId: plainUserId(row?.userId),
+              shareAmount: positiveMoney(row?.shareAmount, 'Member share'),
+            }))
+          : [];
+      const userIds = normalizedShares.map((row) => String(row.userId));
+      if (!normalizedShares.length || new Set(userIds).size !== userIds.length || userIds.some((id) => !id)) {
+        throw purchaseWriteError('Each member must have exactly one positive share');
+      }
+      if (!userIds.includes(String(payerUserId))) throw purchaseWriteError('The payer must have a share');
+      if (!(await validateMemberIds(req.familyId, userIds))) throw purchaseWriteError('Invalid family member in shares');
+      if (purchaseType === 'shared' && userIds.length < 2) throw purchaseWriteError('Shared purchases require two members');
+      const namesByUserId = await memberNameMap(req.familyId, [payerUserId]);
+      if (!accountOwnerMatchesMember(account, payerUserId, namesByUserId)) {
+        throw purchaseWriteError('The upfront account does not belong to the payer');
+      }
+      const sumCents = normalizedShares.reduce((sum, row) => sum + Math.round(row.shareAmount * 100), 0);
+      if (sumCents !== Math.round(total * 100)) throw purchaseWriteError('Member shares must add up to the purchase total');
+      const category = await resolveCategory(req.familyId, categoryId);
+      if (!category) throw purchaseWriteError('Could not resolve expense category');
 
-    if (!String(title || "").trim()) {
-      return res.status(400).json({ ok: false, message: "Purchase title is required" });
-    }
-    if (!Number.isFinite(total) || total <= 0) {
-      return res.status(400).json({ ok: false, message: "Total amount must be greater than 0" });
-    }
-    if (Number.isNaN(date.getTime())) {
-      return res.status(400).json({ ok: false, message: "Valid purchase date is required" });
-    }
-    if (!payerUserId || !payerAccountId) {
-      return res.status(400).json({ ok: false, message: "Payer and payment account are required" });
-    }
-    if (!validMonth(startMonth)) {
-      return res.status(400).json({ ok: false, message: "Valid start month is required" });
-    }
-    if (!Number.isInteger(duration) || duration < 1 || duration > 120) {
-      return res.status(400).json({ ok: false, message: "Months must be between 1 and 120" });
-    }
-    if (!["personal", "shared"].includes(purchaseType)) {
-      return res.status(400).json({ ok: false, message: "Invalid purchase type" });
-    }
+      const [purchase] = await SharedPurchase.create([{
+        familyId: req.familyId, title: String(title).trim(), totalAmount: total,
+        purchaseDate: date, categoryId: category._id, payerUserId, payerAccountId,
+        purchaseType, startMonth, endMonth: addMonths(startMonth, duration - 1),
+        months: duration, shares: normalizedShares.map((row) => ({
+          ...row, monthlyAmount: amountsByMonth(row.shareAmount, duration)[0],
+        })),
+        note: String(note || '').trim(), createdByUserId: req.user.userId,
+      }]);
+      const [upfront] = await Transaction.create([{
+        familyId: req.familyId, txType: 'expense', date, month: purchaseMonth,
+        categoryId: category._id, amount: total,
+        note: `[Large purchase upfront] ${String(title).trim()}`,
+        fromAccountId: payerAccountId, toAccountId: null, paidByUserId: payerUserId,
+        receivedByUserId: null, paymentMode: 'single', paymentParts: [], split: null,
+        budgetImpact: false, ledgerEligible: false, settlementImpact: false,
+        sourceType: 'shared_purchase', sourceId: purchase._id,
+        createdByUserId: req.user.userId,
+      }]);
+      purchase.upfrontTransactionId = upfront._id;
+      await purchase.save();
 
-    const account = await Account.findOne({
-      _id: payerAccountId,
-      familyId: req.familyId,
-      isActive: { $ne: false },
-    });
-    if (!account) {
-      return res.status(400).json({ ok: false, message: "Invalid payer account" });
-    }
-
-    let normalizedShares = Array.isArray(shares)
-      ? shares
-          .map((row) => ({
-            userId: plainUserId(row?.userId),
-            shareAmount: round2(row?.shareAmount),
-          }))
-          .filter((row) => row.userId && row.shareAmount > 0)
-      : [];
-
-    if (purchaseType === "personal") {
-      normalizedShares = [{ userId: String(payerUserId), shareAmount: total }];
-    }
-
-    const uniqueUserIds = new Set(normalizedShares.map((row) => String(row.userId)));
-    if (!normalizedShares.length || uniqueUserIds.size !== normalizedShares.length) {
-      return res.status(400).json({ ok: false, message: "Each member must appear once with a positive share" });
-    }
-    if (!uniqueUserIds.has(String(payerUserId))) {
-      return res.status(400).json({ ok: false, message: "The payer must have a share in the purchase" });
-    }
-    if (!(await validateMemberIds(req.familyId, [...uniqueUserIds]))) {
-      return res.status(400).json({ ok: false, message: "One or more selected members are invalid" });
-    }
-
-    const payerNames = await memberNameMap(req.familyId, [payerUserId]);
-    if (!accountOwnerMatchesMember(account, payerUserId, payerNames)) {
-      return res.status(400).json({
-        ok: false,
-        message: "The selected upfront payment account does not belong to the payer",
-      });
-    }
-
-    const shareTotal = round2(
-      normalizedShares.reduce((sum, row) => sum + Number(row.shareAmount || 0), 0)
-    );
-    if (shareTotal !== total) {
-      return res.status(400).json({
-        ok: false,
-        message: `Member shares must total exactly ${total}`,
-      });
-    }
-
-    const category = await resolveCategory(req.familyId, categoryId);
-    if (!category) {
-      return res.status(400).json({ ok: false, message: "Could not resolve expense category" });
-    }
-
-    const endMonth = addMonths(startMonth, duration - 1);
-    const shareDocs = normalizedShares.map((row) => ({
-      ...row,
-      monthlyAmount: amountsByMonth(row.shareAmount, duration)[0],
-    }));
-
-    purchase = await SharedPurchase.create({
-      familyId: req.familyId,
-      title: String(title).trim(),
-      totalAmount: total,
-      purchaseDate: date,
-      categoryId: category._id,
-      payerUserId,
-      payerAccountId,
-      purchaseType,
-      startMonth,
-      endMonth,
-      months: duration,
-      shares: shareDocs,
-      note: String(note || "").trim(),
-      createdByUserId: req.user.userId,
-    });
-
-    upfrontTransaction = await Transaction.create({
-      familyId: req.familyId,
-      txType: "expense",
-      date,
-      month: monthKey(date),
-      categoryId: category._id,
-      amount: total,
-      note: `[Large purchase upfront] ${String(title).trim()}`,
-      fromAccountId: payerAccountId,
-      toAccountId: null,
-      paidByUserId: payerUserId,
-      receivedByUserId: null,
-      paymentMode: "single",
-      paymentParts: [],
-      split: null,
-      budgetImpact: false,
-      ledgerEligible: false,
-      settlementImpact: false,
-      sourceType: "shared_purchase",
-      sourceId: purchase._id,
-      createdByUserId: req.user.userId,
-    });
-
-    purchase.upfrontTransactionId = upfrontTransaction._id;
-    await purchase.save();
-
-    const preferredDay = date.getDate();
-
-    for (const share of normalizedShares) {
-      const scheduledAmounts = amountsByMonth(share.shareAmount, duration);
-      const paymentRequired = String(share.userId) !== String(payerUserId);
-
-      for (let index = 0; index < duration; index += 1) {
-        const month = addMonths(startMonth, index);
-        const dueDate = dueDateForMonth(month, preferredDay);
-        const installment = await SharedPurchaseInstallment.create({
-          familyId: req.familyId,
-          purchaseId: purchase._id,
-          userId: share.userId,
-          month,
-          dueDate,
-          amount: scheduledAmounts[index],
-          paymentRequired,
-          status: paymentRequired ? "pending" : "allocated",
-        });
-        createdInstallmentIds.push(installment._id);
-
-        // The upfront payer's own share is a monthly budget allocation.
-        // Other members' scheduled repayments do not affect debt/spend until
-        // Record Payment is clicked.
-        if (!paymentRequired) {
-          const ledgerEntry = await upsertSharedInstallmentLedger({
-            familyId: req.familyId,
-            purchase,
-            installment,
-            categoryId: category._id,
-            date: dueDate,
-            createdByUserId: req.user.userId,
+      const schedule = [];
+      for (const share of normalizedShares) {
+        const amounts = amountsByMonth(share.shareAmount, duration);
+        const paymentRequired = String(share.userId) !== String(payerUserId);
+        for (let index = 0; index < duration; index += 1) {
+          const month = addMonths(startMonth, index);
+          schedule.push({
+            familyId: req.familyId, purchaseId: purchase._id, userId: share.userId,
+            month, dueDate: dueDateForMonth(month, date.getDate()), amount: amounts[index],
+            paymentRequired, status: paymentRequired ? 'pending' : 'allocated',
           });
-          createdLedgerIds.push(ledgerEntry._id);
         }
       }
-    }
-
-    await refreshPurchaseStatus(purchase._id, req.familyId);
-
-    res.status(201).json({ ok: true, purchaseId: purchase._id });
+      const installmentDocs = await SharedPurchaseInstallment.insertMany(schedule);
+      const own = installmentDocs.filter((item) => !item.paymentRequired);
+      if (own.length) {
+        const entries = await LedgerEntry.insertMany(own.map((item) => ({
+          familyId: req.familyId, entryType: 'expense', financialType: 'debt',
+          module: 'shared_purchase', date: item.dueDate, month: item.month,
+          categoryId: category._id, amountTotal: item.amount, affectsSettlement: false,
+          paidByUserId: item.userId, receivedByUserId: null,
+          note: `${String(purchase.title).trim()} · monthly allocation`,
+          sourceType: 'shared_purchase_installment', sourceId: item._id,
+          createdByUserId: req.user.userId,
+        })));
+        await Split.insertMany(entries.map((entry, i) => ({
+          familyId: req.familyId, ledgerEntryId: entry._id,
+          userId: own[i].userId, shareAmount: own[i].amount,
+        })));
+        await SharedPurchaseInstallment.bulkWrite(own.map((item, i) => ({
+          updateOne: {
+            filter: { _id: item._id, familyId: req.familyId },
+            update: { $set: { ledgerEntryId: entries[i]._id } },
+          },
+        })));
+      }
+      await refreshPurchaseStatus(purchase._id, req.familyId);
+      return purchase._id;
+    });
+    res.status(result.replayed ? 200 : 201).json({
+      ok: true, purchaseId: result.resultId, replayed: Boolean(result.replayed),
+    });
   } catch (error) {
-    console.error("Create shared purchase error:", error);
-
-    try {
-      if (createdLedgerIds.length) {
-        await Split.deleteMany({ familyId: req.familyId, ledgerEntryId: { $in: createdLedgerIds } });
-        await LedgerEntry.deleteMany({ familyId: req.familyId, _id: { $in: createdLedgerIds } });
-      }
-      if (createdInstallmentIds.length) {
-        await SharedPurchaseInstallment.deleteMany({
-          familyId: req.familyId,
-          _id: { $in: createdInstallmentIds },
-        });
-      }
-      if (upfrontTransaction?._id) {
-        await Transaction.deleteOne({ _id: upfrontTransaction._id, familyId: req.familyId });
-      }
-      if (purchase?._id) {
-        await SharedPurchase.deleteOne({ _id: purchase._id, familyId: req.familyId });
-      }
-    } catch (cleanupError) {
-      console.error("Shared purchase cleanup error:", cleanupError);
-    }
-
-    res.status(500).json({ ok: false, message: error?.message || "Could not create purchase" });
+    console.error('Create shared purchase error:', error);
+    res.status(error.status || 500).json({ ok: false, message: error.message || 'Could not create purchase' });
   }
 });
 
 router.post(
-  "/:purchaseId/installments/:installmentId/pay",
-  requireAuth,
-  requireFamily,
-  async (req, res) => {
-    let paymentTransaction = null;
-    let paymentLedger = null;
-    let installment = null;
-
+  '/:purchaseId/installments/:installmentId/pay',
+  requireAuth, requireFamily, async (req, res) => {
     try {
-      const { fromAccountId, toAccountId, paidDate, note } = req.body || {};
-      installment = await SharedPurchaseInstallment.findOne({
-        _id: req.params.installmentId,
-        purchaseId: req.params.purchaseId,
-        familyId: req.familyId,
-      });
-
-      if (!installment) {
-        return res.status(404).json({ ok: false, message: "Installment not found" });
+      const { fromAccountId, toAccountId, paidDate, note, purchaseId, installmentId } = req.body || {};
+      if (String(purchaseId || '') !== String(req.params.purchaseId) ||
+          String(installmentId || '') !== String(req.params.installmentId)) {
+        throw purchaseWriteError('Purchase and installment identifiers must match the payment request');
       }
-      if (!installment.paymentRequired) {
-        return res.status(400).json({ ok: false, message: "This is a budget allocation and needs no transfer" });
-      }
-      if (installment.status === "paid") {
-        return res.status(400).json({ ok: false, message: "Installment is already paid" });
-      }
-      if (!fromAccountId || !toAccountId || String(fromAccountId) === String(toAccountId)) {
-        return res.status(400).json({ ok: false, message: "Different From and To accounts are required" });
-      }
-
-      const purchase = await SharedPurchase.findOne({
-        _id: req.params.purchaseId,
-        familyId: req.familyId,
-      });
-      if (!purchase) {
-        return res.status(404).json({ ok: false, message: "Purchase not found" });
-      }
-
-      const accounts = await Account.find({
-        _id: { $in: [fromAccountId, toAccountId] },
-        familyId: req.familyId,
-        isActive: { $ne: false },
-      }).lean();
-      if (accounts.length !== 2) {
-        return res.status(400).json({ ok: false, message: "Invalid account selected" });
-      }
-
-      const accountById = new Map(accounts.map((account) => [String(account._id), account]));
-      const fromAccount = accountById.get(String(fromAccountId));
-      const toAccount = accountById.get(String(toAccountId));
-      const namesByUserId = await memberNameMap(req.familyId, [
-        installment.userId,
-        purchase.payerUserId,
-      ]);
-
-      if (!accountOwnerMatchesMember(fromAccount, installment.userId, namesByUserId)) {
-        return res.status(400).json({
-          ok: false,
-          message: "Pay from account must belong to the member making this reimbursement",
+      const result = await createIdempotentFinancialPosting(req, 'sharedPurchase.pay', async () => {
+        const installment = requirePendingInstallmentForPayment(await SharedPurchaseInstallment.findOne({
+          _id: req.params.installmentId, purchaseId: req.params.purchaseId, familyId: req.familyId,
+        }));
+        // Never edit an installment scheduled in older manually corrected months.
+        ensureEditablePurchaseMonth(installment.month);
+        if (!fromAccountId || !toAccountId || String(fromAccountId) === String(toAccountId)) {
+          throw purchaseWriteError('Choose different From and To accounts');
+        }
+        const date = paidDate ? new Date(paidDate) : new Date();
+        const paymentMonth = ensureEditablePurchaseMonth(monthKey(date));
+        await requireOpenMonth(req.familyId, paymentMonth);
+        const purchase = await SharedPurchase.findOne({ _id: req.params.purchaseId, familyId: req.familyId });
+        if (!purchase) throw purchaseWriteError('Purchase not found', 404);
+        const accounts = await Account.find({
+          _id: { $in: [fromAccountId, toAccountId] }, familyId: req.familyId,
+          isActive: { $ne: false },
+        }).lean();
+        if (accounts.length !== 2) throw purchaseWriteError('Invalid account selected');
+        const byId = new Map(accounts.map((account) => [String(account._id), account]));
+        const from = requireLiquidPurchaseAccount(byId.get(String(fromAccountId)));
+        const to = requireLiquidPurchaseAccount(byId.get(String(toAccountId)));
+        const names = await memberNameMap(req.familyId, [installment.userId, purchase.payerUserId]);
+        if (!accountOwnerMatchesMember(from, installment.userId, names)) {
+          throw purchaseWriteError('Payment source must belong to the reimbursing member');
+        }
+        if (!accountOwnerMatchesMember(to, purchase.payerUserId, names)) {
+          throw purchaseWriteError('Receiving account must belong to the upfront payer');
+        }
+        if (await Transaction.exists({ familyId: req.familyId, sourceType: 'shared_purchase_reimbursement', sourceId: installment._id })) {
+          throw purchaseWriteError('An existing reimbursement transaction requires review before another payment.', 409);
+        }
+        if (await LedgerEntry.exists({ familyId: req.familyId, sourceType: 'shared_purchase_installment', sourceId: installment._id })) {
+          throw purchaseWriteError('An old Ledger entry is attached to this pending installment. Review before paying.', 409);
+        }
+        // Conditional update is a database-level race guard, not a UI-only check.
+        const claimed = await SharedPurchaseInstallment.updateOne({
+          _id: installment._id, familyId: req.familyId,
+          status: 'pending', paymentTransactionId: null, ledgerEntryId: null,
+        }, { $set: { status: 'paid' } });
+        if (claimed.modifiedCount !== 1) throw purchaseWriteError('This installment was already changed. Refresh before retrying.', 409);
+        const [payment] = await Transaction.create([{
+          familyId: req.familyId, txType: 'transfer', date, month: paymentMonth, categoryId: null,
+          amount: installment.amount,
+          note: `[Purchase reimbursement] ${purchase.title}${note ? ` · ${String(note).trim()}` : ''}`,
+          fromAccountId, toAccountId,
+          paidByUserId: installment.userId, receivedByUserId: purchase.payerUserId,
+          paymentMode: 'single', paymentParts: [], budgetImpact: false,
+          ledgerEligible: false, settlementImpact: false,
+          sourceType: 'shared_purchase_reimbursement', sourceId: installment._id,
+          createdByUserId: req.user.userId,
+        }]);
+        const ledger = await upsertSharedInstallmentLedger({
+          familyId: req.familyId, purchase, installment, categoryId: purchase.categoryId,
+          date, createdByUserId: req.user.userId, linkInstallment: false,
         });
-      }
-
-      if (!accountOwnerMatchesMember(toAccount, purchase.payerUserId, namesByUserId)) {
-        return res.status(400).json({
-          ok: false,
-          message: "Receiving account must belong to the original upfront payer",
-        });
-      }
-
-      const date = paidDate ? new Date(paidDate) : new Date();
-      if (Number.isNaN(date.getTime())) {
-        return res.status(400).json({ ok: false, message: "Invalid payment date" });
-      }
-
-      paymentTransaction = await Transaction.create({
-        familyId: req.familyId,
-        txType: "transfer",
-        date,
-        month: monthKey(date),
-        categoryId: null,
-        amount: installment.amount,
-        note: `[Purchase reimbursement] ${purchase.title}${note ? ` · ${String(note).trim()}` : ""}`,
-        fromAccountId,
-        toAccountId,
-        paidByUserId: installment.userId,
-        receivedByUserId: purchase.payerUserId,
-        paymentMode: "single",
-        paymentParts: [],
-        budgetImpact: false,
-        ledgerEligible: false,
-        settlementImpact: false,
-        sourceType: "shared_purchase_reimbursement",
-        sourceId: installment._id,
-        createdByUserId: req.user.userId,
+        const written = await SharedPurchaseInstallment.updateOne({
+          _id: installment._id, familyId: req.familyId, status: 'paid', paymentTransactionId: null,
+        }, { $set: {
+          paymentTransactionId: payment._id, ledgerEntryId: ledger._id,
+          fromAccountId, toAccountId, paidAt: date,
+        } });
+        if (written.modifiedCount !== 1) throw purchaseWriteError('Installment changed concurrently. Refresh first.', 409);
+        await refreshPurchaseStatus(purchase._id, req.familyId);
+        return installment._id;
       });
-
-      // Only a recorded reimbursement becomes monthly debt/spend. The account
-      // transfer itself remains excluded from income/expense totals.
-      paymentLedger = await upsertSharedInstallmentLedger({
-        familyId: req.familyId,
-        purchase,
-        installment,
-        categoryId: purchase.categoryId,
-        date,
-        createdByUserId: req.user.userId,
-        linkInstallment: false,
-      });
-
-      installment.status = "paid";
-      installment.ledgerEntryId = paymentLedger._id;
-      installment.paymentTransactionId = paymentTransaction._id;
-      installment.fromAccountId = fromAccountId;
-      installment.toAccountId = toAccountId;
-      installment.paidAt = date;
-      await installment.save();
-
-      const status = await refreshPurchaseStatus(purchase._id, req.familyId);
-      res.json({ ok: true, status, transactionId: paymentTransaction._id });
+      res.status(200).json({ ok: true, installmentId: result.resultId, replayed: Boolean(result.replayed) });
     } catch (error) {
-      try {
-        if (paymentLedger?._id) {
-          await Split.deleteMany({ familyId: req.familyId, ledgerEntryId: paymentLedger._id });
-          await LedgerEntry.deleteOne({ _id: paymentLedger._id, familyId: req.familyId });
-        }
-        if (paymentTransaction?._id) {
-          await Transaction.deleteOne({ _id: paymentTransaction._id, familyId: req.familyId });
-        }
-        if (installment?._id) {
-          await SharedPurchaseInstallment.updateOne(
-            { _id: installment._id, familyId: req.familyId },
-            {
-              $set: {
-                status: "pending",
-                ledgerEntryId: null,
-                paymentTransactionId: null,
-                fromAccountId: null,
-                toAccountId: null,
-                paidAt: null,
-              },
-            }
-          );
-        }
-      } catch (rollbackError) {
-        console.error("Shared purchase payment rollback error:", rollbackError);
-      }
-
-      console.error("Pay shared purchase installment error:", error);
-      res.status(500).json({ ok: false, message: error?.message || "Payment failed" });
+      console.error('Pay shared purchase installment error:', error);
+      res.status(error.status || 500).json({ ok: false, message: error.message || 'Payment failed' });
     }
   }
 );
 
-router.delete(
-  "/:purchaseId/installments/:installmentId/payment",
-  requireAuth,
-  requireFamily,
-  async (req, res) => {
-    try {
-      const installment = await SharedPurchaseInstallment.findOne({
-        _id: req.params.installmentId,
-        purchaseId: req.params.purchaseId,
-        familyId: req.familyId,
-      });
-      if (!installment) {
-        return res.status(404).json({ ok: false, message: "Installment not found" });
-      }
-      if (!installment.paymentRequired || installment.status !== "paid") {
-        return res.status(400).json({ ok: false, message: "No recorded payment to undo" });
-      }
-
-      if (installment.paymentTransactionId) {
-        await Transaction.deleteOne({
-          _id: installment.paymentTransactionId,
-          familyId: req.familyId,
-        });
-      }
-
-      if (installment.ledgerEntryId) {
-        await Split.deleteMany({
-          familyId: req.familyId,
-          ledgerEntryId: installment.ledgerEntryId,
-        });
-        await LedgerEntry.deleteOne({
-          _id: installment.ledgerEntryId,
-          familyId: req.familyId,
-        });
-      }
-
-      installment.status = "pending";
-      installment.paymentTransactionId = null;
-      installment.ledgerEntryId = null;
-      installment.fromAccountId = null;
-      installment.toAccountId = null;
-      installment.paidAt = null;
-      await installment.save();
-
-      await refreshPurchaseStatus(req.params.purchaseId, req.familyId);
-      res.json({ ok: true });
-    } catch (error) {
-      console.error("Undo shared purchase payment error:", error);
-      res.status(500).json({ ok: false, message: error?.message || "Could not undo payment" });
-    }
-  }
-);
-
-router.delete("/:purchaseId", requireAuth, requireFamily, async (req, res) => {
+router.delete('/:purchaseId/installments/:installmentId/payment', requireAuth, requireFamily, async (req, res) => {
   try {
-    const purchase = await SharedPurchase.findOne({
-      _id: req.params.purchaseId,
-      familyId: req.familyId,
+    await runAtomicPosting(async () => {
+      const installment = await SharedPurchaseInstallment.findOne({
+        _id: req.params.installmentId, purchaseId: req.params.purchaseId, familyId: req.familyId,
+      });
+      if (!installment) throw purchaseWriteError('Installment not found', 404);
+      if (!installment.paymentRequired || installment.status !== 'paid') {
+        throw purchaseWriteError('No recorded reimbursement to undo');
+      }
+      ensureEditablePurchaseMonth(installment.month);
+      const purchase = await SharedPurchase.findOne({ _id: installment.purchaseId, familyId: req.familyId });
+      if (!purchase) throw purchaseWriteError('Purchase not found', 404);
+      const tx = installment.paymentTransactionId ? await Transaction.findOne({
+        _id: installment.paymentTransactionId, familyId: req.familyId,
+      }) : null;
+      if (!validReimbursement(installment, purchase, tx)) {
+        throw purchaseWriteError('Reimbursement has incomplete or mismatched account evidence. Review instead of undoing it.', 409);
+      }
+      const matchingTxCount = await Transaction.countDocuments({
+        familyId: req.familyId, sourceType: 'shared_purchase_reimbursement', sourceId: installment._id,
+      });
+      if (matchingTxCount !== 1) {
+        throw purchaseWriteError('Duplicate or missing repayment transfers detected. Review rather than undoing automatically.', 409);
+      }
+      ensureEditablePurchaseMonth(tx.month);
+      await requireOpenMonth(req.familyId, tx.month);
+      const ledger = installment.ledgerEntryId ? await LedgerEntry.findOne({
+        _id: installment.ledgerEntryId, familyId: req.familyId,
+      }) : null;
+      requireLinkedDocument(ledger, {
+        sourceType: 'shared_purchase_installment', sourceId: installment._id,
+        label: 'Reimbursement Ledger record',
+      });
+      ensureEditablePurchaseMonth(ledger.month);
+      await requireOpenMonth(req.familyId, ledger.month);
+      // Claim the paid row before deleting its only linked account movements.
+      const claimed = await SharedPurchaseInstallment.updateOne({
+        _id: installment._id, familyId: req.familyId, status: 'paid',
+        paymentTransactionId: tx._id, ledgerEntryId: ledger._id,
+      }, { $set: { status: 'pending', paymentTransactionId: null, ledgerEntryId: null,
+        fromAccountId: null, toAccountId: null, paidAt: null } });
+      if (claimed.modifiedCount !== 1) throw purchaseWriteError('Payment changed concurrently. Refresh first.', 409);
+      await Split.deleteMany({ familyId: req.familyId, ledgerEntryId: ledger._id });
+      const deletedLedger = await LedgerEntry.deleteOne({ _id: ledger._id, familyId: req.familyId });
+      const deletedTx = await Transaction.deleteOne({ _id: tx._id, familyId: req.familyId });
+      if (deletedLedger.deletedCount !== 1 || deletedTx.deletedCount !== 1) {
+        throw purchaseWriteError('Linked payment records changed. Nothing was reversed.', 409);
+      }
+      await refreshPurchaseStatus(purchase._id, req.familyId);
     });
-    if (!purchase) {
-      return res.status(404).json({ ok: false, message: "Purchase not found" });
-    }
-
-    const installments = await SharedPurchaseInstallment.find({
-      familyId: req.familyId,
-      purchaseId: purchase._id,
-    }).lean();
-
-    const ledgerIds = installments.map((row) => row.ledgerEntryId).filter(Boolean);
-    const paymentTransactionIds = installments
-      .map((row) => row.paymentTransactionId)
-      .filter(Boolean);
-
-    if (ledgerIds.length) {
-      await Split.deleteMany({ familyId: req.familyId, ledgerEntryId: { $in: ledgerIds } });
-      await LedgerEntry.deleteMany({ familyId: req.familyId, _id: { $in: ledgerIds } });
-    }
-
-    const transactionIds = [purchase.upfrontTransactionId, ...paymentTransactionIds].filter(Boolean);
-    if (transactionIds.length) {
-      await Transaction.deleteMany({ familyId: req.familyId, _id: { $in: transactionIds } });
-    }
-
-    await SharedPurchaseInstallment.deleteMany({
-      familyId: req.familyId,
-      purchaseId: purchase._id,
-    });
-    await SharedPurchase.deleteOne({ _id: purchase._id, familyId: req.familyId });
-
     res.json({ ok: true });
   } catch (error) {
-    console.error("Delete shared purchase error:", error);
-    res.status(500).json({ ok: false, message: error?.message || "Delete failed" });
+    const err = atomicPostingError(error);
+    console.error('Undo shared purchase payment error:', err);
+    res.status(err.status || 500).json({ ok: false, message: err.message || 'Could not undo payment' });
+  }
+});
+
+router.delete('/:purchaseId', requireAuth, requireFamily, async (req, res) => {
+  try {
+    await runAtomicPosting(async () => {
+      const purchase = await SharedPurchase.findOne({ _id: req.params.purchaseId, familyId: req.familyId });
+      if (!purchase) throw purchaseWriteError('Purchase not found', 404);
+      const installments = await SharedPurchaseInstallment.find({
+        familyId: req.familyId, purchaseId: purchase._id,
+      });
+      if (!installments.length) throw purchaseWriteError('Purchase has no installment records; review before deletion.', 409);
+      requireSafePlanRemoval(purchase, installments);
+      // Include orphaned legacy rows, not just the installment's linked IDs.
+      const installmentIds = installments.map((item) => item._id);
+      const [unlinkedPayments, unlinkedLedger] = await Promise.all([
+        Transaction.exists({
+          familyId: req.familyId, sourceType: 'shared_purchase_reimbursement',
+          sourceId: { $in: installmentIds },
+        }),
+        LedgerEntry.find({
+          familyId: req.familyId, sourceType: 'shared_purchase_installment',
+          sourceId: { $in: installmentIds },
+        }).select('_id sourceId').lean(),
+      ]);
+      if (unlinkedPayments) throw purchaseWriteError('Reimbursement transactions still exist. Review them before deleting.', 409);
+      const expectedAllocations = new Set(installments
+        .filter((item) => !item.paymentRequired && item.ledgerEntryId)
+        .map((item) => String(item.ledgerEntryId)));
+      if (unlinkedLedger.some((row) => !expectedAllocations.has(String(row._id)))) {
+        throw purchaseWriteError('Legacy or orphan Ledger rows need review before deleting this plan.', 409);
+      }
+      const upfrontMonth = ensureEditablePurchaseMonth(monthKey(purchase.purchaseDate));
+      await requireOpenPurchaseMonths(req.familyId, [upfrontMonth, ...installments.map((item) => item.month)]);
+      const upfront = purchase.upfrontTransactionId ? await Transaction.findOne({
+        _id: purchase.upfrontTransactionId, familyId: req.familyId,
+      }) : null;
+      requireLinkedDocument(upfront, {
+        sourceType: 'shared_purchase', sourceId: purchase._id,
+        amount: purchase.totalAmount, label: 'Original upfront payment',
+      });
+      if (upfront.txType !== 'expense' || String(upfront.fromAccountId) !== String(purchase.payerAccountId)) {
+        throw purchaseWriteError('Original payment account differs from purchase. Review before deleting.', 409);
+      }
+      await requireOpenMonth(req.familyId, ensureEditablePurchaseMonth(upfront.month));
+      const own = installments.filter((item) => !item.paymentRequired);
+      const ledgerIds = own.map((item) => item.ledgerEntryId);
+      if (ledgerIds.some((id) => !id)) throw purchaseWriteError('Monthly allocation Ledger record missing; review before deleting.', 409);
+      const entries = await LedgerEntry.find({ familyId: req.familyId, _id: { $in: ledgerIds } });
+      if (entries.length !== ledgerIds.length) throw purchaseWriteError('Missing linked monthly allocations; review before deleting.', 409);
+      for (const item of own) {
+        const entry = entries.find((row) => String(row._id) === String(item.ledgerEntryId));
+        requireLinkedDocument(entry, {
+          sourceType: 'shared_purchase_installment', sourceId: item._id,
+          label: 'Monthly purchase allocation',
+        });
+        await requireOpenMonth(req.familyId, ensureEditablePurchaseMonth(entry.month));
+      }
+      // No recorded reimbursements are destroyed by plan deletion. Reimbursements
+      // must be undone explicitly and are forbidden if historical/closed.
+      if (ledgerIds.length) {
+        await Split.deleteMany({ familyId: req.familyId, ledgerEntryId: { $in: ledgerIds } });
+        const removed = await LedgerEntry.deleteMany({ familyId: req.familyId, _id: { $in: ledgerIds } });
+        if (removed.deletedCount !== ledgerIds.length) throw purchaseWriteError('Ledger changed concurrently.', 409);
+      }
+      const removedUpfront = await Transaction.deleteOne({ familyId: req.familyId, _id: upfront._id });
+      if (removedUpfront.deletedCount !== 1) throw purchaseWriteError('Upfront payment changed concurrently.', 409);
+      const removedInstallments = await SharedPurchaseInstallment.deleteMany({ familyId: req.familyId, purchaseId: purchase._id });
+      if (removedInstallments.deletedCount !== installments.length) throw purchaseWriteError('Installments changed concurrently.', 409);
+      const removedPurchase = await SharedPurchase.deleteOne({ _id: purchase._id, familyId: req.familyId });
+      if (removedPurchase.deletedCount !== 1) throw purchaseWriteError('Purchase changed concurrently.', 409);
+    });
+    res.json({ ok: true });
+  } catch (error) {
+    const err = atomicPostingError(error);
+    console.error('Delete shared purchase error:', err);
+    res.status(err.status || 500).json({ ok: false, message: err.message || 'Delete failed' });
   }
 });
 

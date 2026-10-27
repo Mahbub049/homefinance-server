@@ -76,6 +76,17 @@ const monthlyBalanceSchema = new mongoose.Schema(
       default: null,
     },
 
+    closingRevisions: {
+      type: [new mongoose.Schema({
+        at: { type: Date, required: true },
+        byUserId: { type: mongoose.Schema.Types.ObjectId, ref: "User" },
+        reason: { type: String, required: true },
+        previousClosingBalance: { type: Number },
+        previousAccountsClosing: { type: [monthlyAccountSnapshotSchema], default: [] },
+      }, { _id: false })],
+      default: [],
+    },
+
     closedByUserId: {
       type: mongoose.Schema.Types.ObjectId,
       ref: "User",

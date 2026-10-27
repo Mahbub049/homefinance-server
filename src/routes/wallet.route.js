@@ -6,11 +6,22 @@ import Account from "../models/Account.js";
 import LedgerEntry from "../models/LedgerEntry.js";
 import Split from "../models/Split.js";
 import FamilyMember from "../models/FamilyMember.js";
+import Family from "../models/Family.js";
 import Transaction from "../models/Transaction.js";
 import Settlement from "../models/Settlement.js";
 import SharedPurchase from "../models/SharedPurchase.js";
 import SharedPurchaseInstallment from "../models/SharedPurchaseInstallment.js";
-import { cleanupPendingInstallmentLedgers } from "../utils/installmentLedger.js";
+import { calculateOrdinaryExpenseShares } from "../utils/expenseFunding.js";
+import { loadReconciledMonth } from "../utils/reconciledAccounts.js";
+import { summarizeLiquidBalances } from "../utils/reconciledAccountMath.js";
+import { calculateMonthlyLiquidFlow } from "../utils/monthlyLiquidFlow.js";
+import { loadSharedBudgetMonth } from "../utils/sharedBudgetReadModel.js";
+import { validReimbursement, idString, WALLET_SHARED_REIMBURSEMENT_FIELDS } from "../utils/sharedPurchaseSchedule.js";
+import { reconcileWalletMonth } from "../utils/walletReconciliation.js";
+import { createIdempotentFinancialPosting } from "../utils/idempotentFinancialPosting.js";
+import { runAtomicPosting } from "../utils/financialPostingTransaction.js";
+import { requireOpenMonth } from "../utils/postingPreflight.js";
+import { ownerAllowed, positiveMoney, validMonth } from "../utils/postingRules.js";
 
 const router = Router();
 
@@ -19,9 +30,7 @@ function round2(n) {
 }
 
 function getId(v) {
-  if (!v) return "";
-  if (typeof v === "string") return v;
-  return String(v._id || v.id || v);
+  return idString(v);
 }
 
 function monthKey(dateInput) {
@@ -146,12 +155,10 @@ async function calculateSharedPurchaseEffects({ familyId, month, memberIds }) {
 
   const installments = await SharedPurchaseInstallment.find({
     familyId,
-    month,
+    month: { $lte: month }, // includes ALL previously unpaid installments
     paymentRequired: true,
   })
-    .select(
-      "purchaseId userId amount status paidAt paymentTransactionId fromAccountId toAccountId"
-    )
+    .select(WALLET_SHARED_REIMBURSEMENT_FIELDS)
     .lean();
 
   if (!installments.length) return effectMap;
@@ -190,7 +197,7 @@ async function calculateSharedPurchaseEffects({ familyId, month, memberIds }) {
         sourceType: "shared_purchase_reimbursement",
       })
         .select(
-          "_id sourceId amount paidByUserId receivedByUserId fromAccountId toAccountId"
+          "_id txType sourceType sourceId amount paidByUserId receivedByUserId fromAccountId toAccountId"
         )
         .lean()
     : [];
@@ -213,14 +220,10 @@ async function calculateSharedPurchaseEffects({ familyId, month, memberIds }) {
       ? paymentTransactionById.get(getId(installment.paymentTransactionId))
       : null;
 
+    const paidMonth = installment.paidAt ? monthKey(installment.paidAt) : null;
     const verifiedPaid = Boolean(
-      installment.status === "paid" &&
-        installment.paidAt &&
-        paymentTx &&
-        getId(paymentTx.sourceId) === getId(installment._id) &&
-        getId(paymentTx.paidByUserId) === debtorId &&
-        getId(paymentTx.receivedByUserId) === receiverId &&
-        Math.abs(round2(paymentTx.amount || 0) - amount) <= 0.009
+      validReimbursement(installment, purchase, paymentTx) &&
+      paidMonth && paidMonth <= month
     );
 
     if (verifiedPaid) {
@@ -478,11 +481,11 @@ function buildSettlementInfo({ resultUsers, settlements }) {
 router.get("/summary", requireAuth, requireFamily, async (req, res) => {
   try {
     const month = String(req.query.month || "").trim();
-    if (!month) {
-      return res.status(400).json({ ok: false, message: "month required" });
+    if (!validMonth(month)) {
+      return res.status(400).json({ ok: false, message: "Valid month (YYYY-MM) required" });
     }
-
-    await cleanupPendingInstallmentLedgers(req.familyId, month);
+    // Phase 8: GET must never run the historical installment cleanup or
+    // modify financial records merely because the user opens Wallet.
 
     const members = await FamilyMember.find({ familyId: req.familyId }).populate(
       "userId",
@@ -516,60 +519,31 @@ router.get("/summary", requireAuth, requireFamily, async (req, res) => {
     //    Single payment: count the transaction amount for the selected payer.
     //    Split payment: count each payment part for the member who actually paid it.
     // -----------------------------
-    const [expenseEntries, expenseTransactions] = await Promise.all([
-      LedgerEntry.find({
-        familyId: req.familyId,
-        entryType: "expense",
-        month,
-        affectsSettlement: { $ne: false },
-      }),
-      Transaction.find({
-        familyId: req.familyId,
-        txType: "expense",
-        month,
-        settlementImpact: { $ne: false },
-      }).select("amount paidByUserId paymentMode paymentParts"),
-    ]);
-
-    const paidMap = {};
-    for (const uid of userIdStrings) paidMap[uid] = 0;
-
-    for (const tx of expenseTransactions) {
-      const parts = Array.isArray(tx.paymentParts) ? tx.paymentParts : [];
-
-      if (tx.paymentMode === "split" && parts.length > 0) {
-        for (const part of parts) {
-          const uid = getId(part.userId);
-          if (uid && paidMap[uid] !== undefined) {
-            paidMap[uid] = round2(paidMap[uid] + Number(part.amount || 0));
-          }
-        }
-      } else {
-        const uid = getId(tx.paidByUserId);
-        if (uid && paidMap[uid] !== undefined) {
-          paidMap[uid] = round2(paidMap[uid] + Number(tx.amount || 0));
-        }
-      }
-    }
-
-    // -----------------------------
-    // 3) Expense share per user
-    // -----------------------------
-    const expenseEntryIds = expenseEntries.map((e) => e._id);
-
-    const splits = await Split.find({
+    const expenseEntries = await LedgerEntry.find({
       familyId: req.familyId,
-      ledgerEntryId: { $in: expenseEntryIds },
+      entryType: "expense",
+      month,
+      affectsSettlement: { $ne: false },
+      sourceType: { $ne: "shared_purchase_installment" },
+    }).select("_id sourceType sourceId paidByUserId amountTotal entryType affectsSettlement").lean();
+
+    const linkedTransactionIds = expenseEntries
+      .filter((entry) => entry.sourceType === "transaction" && entry.sourceId)
+      .map((entry) => entry.sourceId);
+    const [expenseTransactions, splits] = await Promise.all([
+      linkedTransactionIds.length
+        ? Transaction.find({ familyId: req.familyId, _id: { $in: linkedTransactionIds }, txType: "expense" })
+          .select("_id txType amount paidByUserId paymentMode paymentParts settlementImpact").lean()
+        : [],
+      Split.find({ familyId: req.familyId, ledgerEntryId: { $in: expenseEntries.map((e) => e._id) } })
+        .select("ledgerEntryId userId shareAmount").lean(),
+    ]);
+    const { paidMap, shareMap, balanced: ordinaryExpenseBalanced, settlementDiscrepancy, issues: ordinaryExpenseIssues } = calculateOrdinaryExpenseShares({
+      entries: expenseEntries,
+      splits,
+      transactions: expenseTransactions,
+      userIds: userIdStrings,
     });
-
-    const shareMap = {};
-    for (const uid of userIdStrings) shareMap[uid] = 0;
-
-    for (const s of splits) {
-      const uid = getId(s.userId);
-      if (!uid || shareMap[uid] === undefined) continue;
-      shareMap[uid] = round2(shareMap[uid] + Number(s.shareAmount || 0));
-    }
 
     // -----------------------------
     // 4) Transfers + managed Shared/Large Purchase obligations
@@ -701,9 +675,58 @@ router.get("/summary", requireAuth, requireFamily, async (req, res) => {
     }
 
     // -----------------------------
-    // 6) Final pending suggestion after every supported settlement component
+    // 6) Actual liquid cash held in tracked accounts.
+    // Never infer this from monthly budget costs or settlement obligations.
+    // Shared reimbursements and same-owner savings deposits have already been
+    // included exactly once as real transfers by the account read model.
+    // -----------------------------
+    const scheduledBudget = await loadSharedBudgetMonth(req.familyId, month);
+    const reconciled = await loadReconciledMonth(req.familyId, month);
+    const actualCash = summarizeLiquidBalances(reconciled.closing.accounts);
+    // Month-only cash flow does not include previous closing balances and
+    // must use real account transactions, never Ledger expense-share rows.
+    const monthTransactions = await Transaction.find({ familyId: req.familyId, month })
+      .select("_id txType amount sourceType fromAccountId toAccountId paymentMode paymentParts")
+      .lean();
+    const monthlyCashFlow = calculateMonthlyLiquidFlow(reconciled.systemClosing.accounts, monthTransactions);
+    // Cross-check against the existing account reconciliation engine. Both
+    // independently derive month-only movements and must agree to a cent.
+    const sumLiquid = (rows) => round2((rows || []).filter((r) => ["cash", "bank", "wallet"].includes(r.type))
+      .reduce((total, row) => total + Number(row.balance || 0), 0));
+    const reconciledMovement = round2(sumLiquid(reconciled.systemClosing.accounts) - sumLiquid(reconciled.opening.accounts));
+    if (Math.abs(reconciledMovement - monthlyCashFlow.household.remainingFromMonth) > 0.01) {
+      monthlyCashFlow.issues.push({ code: "MONTHLY_CASH_FLOW_MISMATCH", expected: reconciledMovement, calculated: monthlyCashFlow.household.remainingFromMonth });
+    }
+    const ownerMonthFlows = monthlyCashFlow.byOwner;
+    const accountOwnerMap = buildOwnerToUserId(members);
+    for (const row of resultUsers) {
+      const owner = Object.keys(accountOwnerMap).find((key) => key !== "Joint" && accountOwnerMap[key] === row.userId);
+      row.availableCash = owner ? (actualCash.owners[owner] ?? 0) : null;
+      // Joint accounts appear once at household level and are not arbitrarily
+      // divided between members as if they were separate personal bank accounts.
+      row.availableCashExcludesJoint = true;
+      row.scheduledLargePurchaseShare = round2(scheduledBudget.summary.byMember[row.userId] || 0);
+      row.monthlyCashFlow = owner ? (ownerMonthFlows[owner] || {
+        income: 0, expenses: 0, savedOrInvested: 0, savingsWithdrawn: 0,
+        transfersIn: 0, transfersOut: 0, remainingFromMonth: 0,
+      }) : null;
+    }
+
+    // -----------------------------
+    // 7) Settlement suggestions remain distinct from available cash.
     // -----------------------------
     const settlementInfo = buildSettlementInfo({ resultUsers, settlements });
+    const financialReconciliation = reconcileWalletMonth({
+      month,
+      accountStatement: reconciled,
+      monthlyFlow: monthlyCashFlow,
+      expenseIntegrity: { balanced: ordinaryExpenseBalanced, discrepancy: settlementDiscrepancy, issues: ordinaryExpenseIssues },
+      users: resultUsers,
+      settlementSummary: settlementInfo.settlementSummary,
+      settlements,
+      verifiedSettlementIds: verifiedWalletSettlements.map((record) => getId(record._id)),
+      recordedIncome: round2(Object.values(incomeMap).reduce((sum, value) => sum + value, 0)),
+    });
 
     res.json({
       ok: true,
@@ -713,6 +736,18 @@ router.get("/summary", requireAuth, requireFamily, async (req, res) => {
       settlementSummary: settlementInfo.settlementSummary,
       settlementTotals: settlementInfo.settlementTotals,
       settlements,
+      ordinaryExpenseIntegrity: { balanced: ordinaryExpenseBalanced, discrepancy: settlementDiscrepancy, issues: ordinaryExpenseIssues },
+      financialReconciliation,
+      monthlyCashFlow,
+      monthlyBudgetAllocation: scheduledBudget.summary,
+      accountCash: {
+        ...actualCash,
+        month,
+        source: reconciled.closed ? "closed_month_snapshot" : "recorded_transactions",
+        anchorMonth: reconciled.anchorMonth,
+        issues: reconciled.issues,
+        staleClosedCount: reconciled.staleClosedCount,
+      },
       transferLogic: {
         sameOwner: "ignored",
         crossOwner: "from owner decreases, to owner increases",
@@ -732,147 +767,167 @@ router.get("/summary", requireAuth, requireFamily, async (req, res) => {
 // { settlementType:"past_pending", date, fromUserId, toUserId, amount, note }
 router.post("/settlements", requireAuth, requireFamily, async (req, res) => {
   try {
-    const {
-      settlementType = "wallet",
-      date,
-      fromUserId,
-      toUserId,
-      amount,
-      fromAccountId,
-      toAccountId,
-      note,
-    } = req.body || {};
-
+    const { settlementType = "wallet", date, fromUserId, toUserId, amount,
+      fromAccountId, toAccountId, note } = req.body || {};
     if (!["wallet", "past_pending"].includes(settlementType)) {
       return res.status(400).json({ ok: false, message: "Invalid settlement type" });
     }
-
-    const amt = Number(amount || 0);
-    if (!amt || amt <= 0) {
-      return res.status(400).json({ ok: false, message: "Amount must be > 0" });
-    }
-
+    const amt = positiveMoney(amount);
     const dt = date ? new Date(date) : new Date();
-    if (Number.isNaN(dt.getTime())) {
-      return res.status(400).json({ ok: false, message: "Invalid date" });
-    }
-
+    if (Number.isNaN(dt.getTime())) return res.status(400).json({ ok: false, message: "Invalid date" });
     const month = monthKey(dt);
-
-    if (!fromUserId || !toUserId) {
-      return res.status(400).json({ ok: false, message: "From and To member are required" });
+    if (!validMonth(month) || month < '2026-10') {
+      return res.status(409).json({ ok: false, message: 'Historical settlements before October 2026 remain untouched.' });
     }
-
-    if (String(fromUserId) === String(toUserId)) {
-      return res.status(400).json({ ok: false, message: "From and To member must be different" });
+    if (!fromUserId || !toUserId || getId(fromUserId) === getId(toUserId)) {
+      return res.status(400).json({ ok: false, message: "Select two different family members" });
     }
-
-    const members = await FamilyMember.find({ familyId: req.familyId }).select("userId").lean();
-    const memberIds = members.map((m) => String(m.userId));
-
-    if (!memberIds.includes(String(fromUserId)) || !memberIds.includes(String(toUserId))) {
-      return res.status(400).json({ ok: false, message: "Invalid family member selected" });
-    }
-
-    let transaction = null;
-
-    if (settlementType === "wallet") {
-      if (!fromAccountId || !toAccountId) {
-        return res.status(400).json({ ok: false, message: "From and To accounts are required" });
+    const op = settlementType === 'wallet' ? 'wallet.settlement' : 'wallet.pastPending';
+    const record = await createIdempotentFinancialPosting(req, op, async () => {
+      // Serialize distinct request keys for the same family. Otherwise two
+      // parallel settlements could both read the same unpaid share and overpay.
+      const lock = await Family.updateOne({ _id: req.familyId }, { $inc: { walletSettlementRevision: 1 } });
+      if (lock.matchedCount !== 1) throw new Error('Family settlement lock unavailable');
+      await requireOpenMonth(req.familyId, month);
+      const memberships = await FamilyMember.find({ familyId: req.familyId })
+        .populate('userId', 'name').lean();
+      const byId = new Map(memberships.filter(m => m.userId).map(m => [getId(m.userId), m.userId.name]));
+      if (!byId.has(getId(fromUserId)) || !byId.has(getId(toUserId))) {
+        const error = new Error('Both members must belong to the current family'); error.status = 400; throw error;
       }
-
-      if (String(fromAccountId) === String(toAccountId)) {
-        return res.status(400).json({ ok: false, message: "From and To accounts must be different" });
+      let transfer = null;
+      if (settlementType === 'wallet') {
+        // Generic Wallet settlement must NEVER pay managed Shared Purchases.
+        const obligations = await calculateSharedPurchaseEffects({
+          familyId: req.familyId, month, memberIds: [...byId.keys()],
+        });
+        const due = round2(Object.values(obligations).reduce((sum, row) => sum + Number(row.sharedPurchaseDue || 0), 0));
+        if (due > 0.009) {
+          const error = new Error(`Unpaid Shared Purchase reimbursements (${due.toFixed(2)}) must be recorded in Shared Purchases first.`);
+          error.status = 409; throw error;
+        }
+        const expenseRows = await LedgerEntry.find({
+          familyId: req.familyId, month, entryType: 'expense',
+          affectsSettlement: { $ne: false }, sourceType: { $ne: 'shared_purchase_installment' },
+        }).select('_id entryType sourceType sourceId paidByUserId amountTotal affectsSettlement').lean();
+        const txIds = expenseRows.filter(e => e.sourceType === 'transaction' && e.sourceId).map(e => e.sourceId);
+        const [costSplits, paidTransactions, priorSettlements] = await Promise.all([
+          Split.find({ familyId: req.familyId, ledgerEntryId: { $in: expenseRows.map(e => e._id) } }).lean(),
+          txIds.length ? Transaction.find({ familyId: req.familyId, _id: { $in: txIds }, txType: 'expense' })
+            .select('_id txType amount paidByUserId paymentMode paymentParts settlementImpact').lean() : [],
+          Settlement.find({ familyId: req.familyId, month, settlementType: 'wallet', status: 'settled' }).lean(),
+        ]);
+        const reconciliation = calculateOrdinaryExpenseShares({
+          entries: expenseRows, splits: costSplits, transactions: paidTransactions, userIds: [...byId.keys()],
+        });
+        if (!reconciliation.balanced) {
+          const error = new Error('Ledger expense funding and member shares do not reconcile. Correct them before settlement.');
+          error.status = 409; throw error;
+        }
+        const statement = await loadReconciledMonth(req.familyId, month);
+        const severeAccountIssues = statement.issues.filter(issue => !['STALE_CLOSED_MONTH', 'MANUAL_CLOSING_ADJUSTMENT'].includes(issue.code));
+        if (severeAccountIssues.length) {
+          const error = new Error('Posted account movements contain reconciliation errors. Fix funding links before settling.');
+          error.status = 409; throw error;
+        }
+        const verified = await getVerifiedWalletSettlements({ familyId: req.familyId, settlements: priorSettlements });
+        const settledMap = buildWalletSettlementEffects({ memberIds: [...byId.keys()], settlements: verified });
+        const position = (uid) => round2(
+          Number(reconciliation.paidMap[uid] || 0) - Number(reconciliation.shareMap[uid] || 0) +
+          Number(settledMap[uid]?.walletSettlementNet || 0)
+        );
+        const payer = position(getId(fromUserId));
+        const receiver = position(getId(toUserId));
+        const allowedAmount = round2(Math.min(Math.max(0, -payer), Math.max(0, receiver)));
+        if (allowedAmount < 0.01 || amt > allowedAmount) {
+          const error = new Error(`Settlement exceeds the remaining ordinary expense amount (${allowedAmount.toFixed(2)}). Refresh Wallet.`);
+          error.status = 409; throw error;
+        }
+        if (!fromAccountId || !toAccountId || getId(fromAccountId) === getId(toAccountId)) {
+          const error = new Error('Choose two different payment accounts.'); error.status = 400; throw error;
+        }
+        const accounts = await Account.find({ familyId: req.familyId, _id: { $in: [fromAccountId, toAccountId] } }).lean();
+        const accountById = new Map(accounts.map(a => [getId(a._id), a]));
+        const from = accountById.get(getId(fromAccountId));
+        const to = accountById.get(getId(toAccountId));
+        if (!from || !to || [from, to].some(a => a.isActive === false || !['cash', 'bank', 'wallet'].includes(a.type))) {
+          const error = new Error('Both accounts must be active cash, bank, or mobile-wallet accounts.'); error.status = 400; throw error;
+        }
+        if (from.owner === 'Joint' || to.owner === 'Joint' ||
+            !ownerAllowed(from.owner, byId.get(getId(fromUserId))) ||
+            !ownerAllowed(to.owner, byId.get(getId(toUserId)))) {
+          const error = new Error('Settlement must move between the selected members’ own accounts; Joint accounts are not valid here.');
+          error.status = 400; throw error;
+        }
+        if ([from, to].some(a => /credit\s*card/i.test(a.name || ''))) {
+          const error = new Error('Credit-card accounts cannot be used for an ordinary Wallet settlement.'); error.status = 400; throw error;
+        }
+        // Transfer and settlement record commit or roll back as one operation.
+        [transfer] = await Transaction.create([{
+          familyId: req.familyId, txType: 'transfer', date: dt, month, categoryId: null,
+          amount: amt, note: `[Settlement] ${String(note || 'Monthly settlement').trim()}`,
+          fromAccountId, toAccountId, paidByUserId: fromUserId, receivedByUserId: toUserId,
+          paymentMode: 'single', paymentParts: [], budgetImpact: false, ledgerEligible: false,
+          settlementImpact: false, sourceType: 'wallet_settlement', sourceId: null,
+          createdByUserId: req.user.userId,
+        }]);
       }
-
-      const accounts = await Account.find({
-        _id: { $in: [fromAccountId, toAccountId] },
-        familyId: req.familyId,
-      }).lean();
-
-      if (accounts.length !== 2) {
-        return res.status(400).json({ ok: false, message: "Invalid account selected" });
-      }
-
-      transaction = await Transaction.create({
-        familyId: req.familyId,
-        txType: "transfer",
-        date: dt,
-        month,
-        categoryId: null,
-        amount: amt,
-        note: `[Settlement] ${(note || "Monthly settlement").trim()}`,
-        fromAccountId,
-        toAccountId,
-        paidByUserId: fromUserId,
-        receivedByUserId: toUserId,
-        paymentMode: "single",
-        paymentParts: [],
-        budgetImpact: false,
-        ledgerEligible: false,
-        settlementImpact: false,
-        sourceType: "wallet_settlement",
-        sourceId: null,
-        createdByUserId: req.user.userId,
-      });
-    }
-
-    const item = await Settlement.create({
-      familyId: req.familyId,
-      month,
-      date: dt,
-      fromUserId,
-      toUserId,
-      amount: amt,
-      settlementType,
-      status: "settled",
-      fromAccountId: settlementType === "wallet" ? fromAccountId : null,
-      toAccountId: settlementType === "wallet" ? toAccountId : null,
-      transactionId: transaction?._id || null,
-      affectsWallet: settlementType === "wallet",
-      affectsLedger: settlementType === "wallet",
-      affectsMonthlySettlement: settlementType === "wallet",
-      note: (note || "").trim(),
-      createdByUserId: req.user.userId,
+      const [settlement] = await Settlement.create([{
+        familyId: req.familyId, month, date: dt, fromUserId, toUserId, amount: amt,
+        settlementType, status: 'settled',
+        fromAccountId: settlementType === 'wallet' ? fromAccountId : null,
+        toAccountId: settlementType === 'wallet' ? toAccountId : null,
+        transactionId: transfer?._id || null,
+        affectsWallet: settlementType === 'wallet',
+        affectsLedger: settlementType === 'wallet',
+        affectsMonthlySettlement: settlementType === 'wallet',
+        note: String(note || '').trim(), createdByUserId: req.user.userId,
+      }]);
+      return settlement._id;
     });
-
-    res.status(201).json({ ok: true, item, transactionId: transaction?._id || null });
+    const item = await Settlement.findOne({ familyId: req.familyId, _id: record.resultId });
+    return res.status(record.replayed ? 200 : 201).json({ ok: true, item,
+      transactionId: item?.transactionId || null, replayed: record.replayed });
   } catch (err) {
-    console.error("Create settlement error:", err);
-    res.status(500).json({ ok: false, message: err?.message || "Create settlement failed" });
+    console.error('Create settlement error:', err);
+    return res.status(err.status || 500).json({ ok: false, message: err.message || 'Create settlement failed' });
   }
 });
 
-// DELETE /api/wallet/settlements/:id
-// If the settlement created a transfer transaction, this also removes that transfer.
-router.delete("/settlements/:id", requireAuth, requireFamily, async (req, res) => {
+// DELETE is also atomic. Reject missing linked transfers rather than silently
+// deleting only half of the record. Existing old months remain read-only.
+router.delete('/settlements/:id', requireAuth, requireFamily, async (req, res) => {
   try {
-    const item = await Settlement.findOne({ _id: req.params.id, familyId: req.familyId });
-    if (!item) return res.status(404).json({ ok: false, message: "Settlement not found" });
-
-    let removedTransaction = false;
-
-    if (item.transactionId) {
-      const ledgerEntries = await LedgerEntry.find({
-        familyId: req.familyId,
-        sourceId: item.transactionId,
-      }).select("_id");
-
-      for (const le of ledgerEntries) {
-        await Split.deleteMany({ familyId: req.familyId, ledgerEntryId: le._id });
-        await LedgerEntry.deleteOne({ _id: le._id, familyId: req.familyId });
+    const removed = await runAtomicPosting(async () => {
+      const lock = await Family.updateOne({ _id: req.familyId }, { $inc: { walletSettlementRevision: 1 } });
+      if (lock.matchedCount !== 1) throw new Error('Family settlement lock unavailable');
+      const item = await Settlement.findOne({ _id: req.params.id, familyId: req.familyId });
+      if (!item) { const e = new Error('Settlement not found'); e.status = 404; throw e; }
+      if (item.month < '2026-10') {
+        const e = new Error('Historical settlements before October 2026 are preserved.'); e.status = 409; throw e;
       }
-
-      const txDelete = await Transaction.deleteOne({ _id: item.transactionId, familyId: req.familyId });
-      removedTransaction = txDelete.deletedCount > 0;
-    }
-
-    await Settlement.deleteOne({ _id: item._id, familyId: req.familyId });
-
-    res.json({ ok: true, removedTransaction });
+      await requireOpenMonth(req.familyId, item.month);
+      if (item.settlementType === 'wallet' && !item.transactionId) {
+        const e = new Error('Settlement is missing its transfer; review record integrity before deletion.'); e.status = 409; throw e;
+      }
+      if (item.transactionId) {
+        const tx = await Transaction.findOne({ _id: item.transactionId, familyId: req.familyId,
+          sourceType: 'wallet_settlement', txType: 'transfer' });
+        if (!tx) { const e = new Error('Settlement transfer could not be verified; no deletion performed.'); e.status = 409; throw e; }
+        const ledgers = await LedgerEntry.find({ familyId: req.familyId, sourceId: tx._id }).select('_id');
+        for (const ledger of ledgers) {
+          await Split.deleteMany({ familyId: req.familyId, ledgerEntryId: ledger._id });
+          await LedgerEntry.deleteOne({ familyId: req.familyId, _id: ledger._id });
+        }
+        await Transaction.deleteOne({ familyId: req.familyId, _id: tx._id });
+      }
+      await Settlement.deleteOne({ _id: item._id, familyId: req.familyId });
+      return !!item.transactionId;
+    });
+    res.json({ ok: true, removedTransaction: removed });
   } catch (err) {
-    console.error("Delete settlement error:", err);
-    res.status(500).json({ ok: false, message: err?.message || "Delete settlement failed" });
+    console.error('Delete settlement error:', err);
+    res.status(err.status || 500).json({ ok: false, message: err.message || 'Delete settlement failed' });
   }
 });
 

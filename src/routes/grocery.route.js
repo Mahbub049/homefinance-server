@@ -11,6 +11,10 @@ import FamilyMember from "../models/FamilyMember.js";
 import Transaction from "../models/Transaction.js";
 
 import { splitEqual, splitPersonal, splitRatio, splitFixed, round2 } from "../utils/splitCalc.js";
+import { verifyExpensePosting, requireOpenMonth } from '../utils/postingPreflight.js';
+import { nonnegativeMoney, positiveMoney, postingError } from '../utils/postingRules.js';
+import { runAtomicPosting } from '../utils/financialPostingTransaction.js';
+import { existingFinancialPosting, createIdempotentFinancialPosting } from '../utils/idempotentFinancialPosting.js';
 
 const router = Router();
 
@@ -86,9 +90,9 @@ async function prepareGroceryPayload(req) {
 
     const qty = Number(it.qty || 0);
     const unitPrice = Number(it.unitPrice || 0);
-    const itemDiscount = Number(it.itemDiscount || 0);
+    const itemDiscount = nonnegativeMoney(it.itemDiscount, 'Item discount');
 
-    if (!Number.isFinite(qty) || qty < 0) {
+    if (!Number.isFinite(qty) || qty <= 0) {
       const err = new Error("Invalid item quantity");
       err.status = 400;
       throw err;
@@ -134,9 +138,12 @@ async function prepareGroceryPayload(req) {
 
   itemsSubtotal = round2(itemsSubtotal);
 
-  let totalPayable = itemsSubtotal - Number(discountTotal || 0) + Number(deliveryFee || 0);
-  if (!vatIncluded) totalPayable += Number(vatAmount || 0);
-  totalPayable = round2(totalPayable);
+  const orderDiscount = nonnegativeMoney(discountTotal, 'Order discount');
+  const delivery = nonnegativeMoney(deliveryFee, 'Delivery fee');
+  const vat = nonnegativeMoney(vatAmount, 'VAT');
+  if (orderDiscount > itemsSubtotal) throw postingError('Order discount cannot exceed the item subtotal');
+  let totalPayable = round2(itemsSubtotal - orderDiscount + delivery + (vatIncluded ? 0 : vat));
+  positiveMoney(totalPayable, 'Grocery total');
 
   if (totalPayable <= 0) {
     const err = new Error("Total payable must be > 0");
@@ -181,6 +188,8 @@ async function prepareGroceryPayload(req) {
   }
 
   const month = toMonthString(dateObj);
+  await verifyExpensePosting({ familyId: req.familyId, date: dateObj, paidByUserId,
+    fromAccountId, categoryId, amount: totalPayable });
   const groceryNote = `Grocery: ${shopName || "Transaction"}`;
 
   return {
@@ -292,40 +301,47 @@ router.get("/", requireAuth, requireFamily, async (req, res) => {
 // POST /api/grocery
 router.post("/", requireAuth, requireFamily, async (req, res) => {
   try {
+    // Check before preflight: a safe retry must succeed even if this month
+    // was closed after the original request committed.
+    const replay = await existingFinancialPosting(req, 'grocery.create');
+    if (replay) return res.json({ ok: true, txnId: replay.resultId, replayed: true });
     const data = await prepareGroceryPayload(req);
 
-    const groceryTxnId = new mongoose.Types.ObjectId();
+    const result = await createIdempotentFinancialPosting(req, 'grocery.create', async () => {
+          const groceryTxnId = new mongoose.Types.ObjectId();
 
-    const tx = await Transaction.create(data.transactionFields);
+          const tx = await Transaction.create(data.transactionFields);
 
-    const entry = await LedgerEntry.create({
-      ...data.ledgerFields,
-      sourceType: "transaction",
-      sourceId: tx._id,
+          const entry = await LedgerEntry.create({
+            ...data.ledgerFields,
+            sourceType: "transaction",
+            sourceId: tx._id,
+          });
+
+          await replaceSplits({
+            familyId: req.familyId,
+            ledgerEntryId: entry._id,
+            splitRows: data.splitRows,
+          });
+
+          const txn = await GroceryTransaction.create({
+            _id: groceryTxnId,
+            ...data.groceryFields,
+            transactionId: tx._id,
+            ledgerEntryId: entry._id,
+          });
+
+          await GroceryItem.insertMany(
+            data.preparedItems.map((it) => ({
+              familyId: req.familyId,
+              txnId: txn._id,
+              ...it,
+            }))
+          );
+
+          return txn._id;
     });
-
-    await replaceSplits({
-      familyId: req.familyId,
-      ledgerEntryId: entry._id,
-      splitRows: data.splitRows,
-    });
-
-    const txn = await GroceryTransaction.create({
-      _id: groceryTxnId,
-      ...data.groceryFields,
-      transactionId: tx._id,
-      ledgerEntryId: entry._id,
-    });
-
-    await GroceryItem.insertMany(
-      data.preparedItems.map((it) => ({
-        familyId: req.familyId,
-        txnId: txn._id,
-        ...it,
-      }))
-    );
-
-    res.json({ ok: true, txnId: txn._id });
+    res.json({ ok: true, txnId: result.resultId, replayed: result.replayed });
   } catch (e) {
     res.status(e?.status || 500).json({ ok: false, message: e?.message || "Save failed" });
   }
@@ -335,76 +351,90 @@ router.post("/", requireAuth, requireFamily, async (req, res) => {
 // Updates grocery transaction AND keeps Transaction + LedgerEntry + Split rows synced automatically.
 router.put("/:id", requireAuth, requireFamily, async (req, res) => {
   try {
-    const txn = await GroceryTransaction.findOne({ _id: req.params.id, familyId: req.familyId });
-    if (!txn) return res.status(404).json({ ok: false, message: "Not found" });
-
+    // Preflight uses parallel independent reads. Run it before the MongoDB
+    // transaction; parallel operations within one transaction aren't supported.
     const data = await prepareGroceryPayload(req);
+    const txnId = await runAtomicPosting(async () => {
+          const txn = await GroceryTransaction.findOne({ _id: req.params.id, familyId: req.familyId });
+          if (!txn) throw postingError("Grocery entry not found", 404);
+          await requireOpenMonth(req.familyId, txn.month);
+          if (txn.transactionId) {
+            const original = await Transaction.findOne({ _id: txn.transactionId, familyId: req.familyId }).select('month').lean();
+            if (original?.month && original.month !== txn.month) await requireOpenMonth(req.familyId, original.month);
+          }
+          // Recheck the target month inside the transaction in addition to preflight.
+          await requireOpenMonth(req.familyId, data.month);
 
-    let tx = null;
-    if (txn.transactionId) {
-      tx = await Transaction.findOne({ _id: txn.transactionId, familyId: req.familyId });
-    }
+          let tx = null;
+          if (txn.transactionId) {
+            tx = await Transaction.findOne({ _id: txn.transactionId, familyId: req.familyId });
+          }
 
-    if (tx) {
-      await Transaction.updateOne(
-        { _id: tx._id, familyId: req.familyId },
-        { $set: data.transactionFields }
-      );
-    } else {
-      tx = await Transaction.create(data.transactionFields);
-    }
+          if (tx) {
+            await Transaction.updateOne(
+              { _id: tx._id, familyId: req.familyId },
+              { $set: data.transactionFields }
+            );
+          } else {
+            tx = await Transaction.create(data.transactionFields);
+          }
 
-    let entry = null;
-    if (txn.ledgerEntryId) {
-      entry = await LedgerEntry.findOne({ _id: txn.ledgerEntryId, familyId: req.familyId });
-    }
+          let entry = null;
+          if (txn.ledgerEntryId) {
+            entry = await LedgerEntry.findOne({ _id: txn.ledgerEntryId, familyId: req.familyId });
+          }
 
-    if (entry) {
-      await LedgerEntry.updateOne(
-        { _id: entry._id, familyId: req.familyId },
-        {
-          $set: {
-            ...data.ledgerFields,
-            sourceType: "transaction",
-            sourceId: tx._id,
-          },
-        }
-      );
-    } else {
-      entry = await LedgerEntry.create({
-        ...data.ledgerFields,
-        sourceType: "transaction",
-        sourceId: tx._id,
-      });
-    }
+          if (entry && txn.transactionId && String(entry.sourceId) !== String(txn.transactionId)) {
+            throw postingError("Grocery ledger linkage is inconsistent; review before editing", 409);
+          }
+          if (entry) {
+            await LedgerEntry.updateOne(
+              { _id: entry._id, familyId: req.familyId },
+              {
+                $set: {
+                  ...data.ledgerFields,
+                  sourceType: "transaction",
+                  sourceId: tx._id,
+                },
+              }
+            );
+          } else {
+            entry = await LedgerEntry.create({
+              ...data.ledgerFields,
+              sourceType: "transaction",
+              sourceId: tx._id,
+            });
+          }
 
-    await replaceSplits({
-      familyId: req.familyId,
-      ledgerEntryId: entry._id,
-      splitRows: data.splitRows,
+          await replaceSplits({
+            familyId: req.familyId,
+            ledgerEntryId: entry._id,
+            splitRows: data.splitRows,
+          });
+
+          await GroceryTransaction.updateOne(
+            { _id: txn._id, familyId: req.familyId },
+            {
+              $set: {
+                ...data.groceryFields,
+                transactionId: tx._id,
+                ledgerEntryId: entry._id,
+              },
+            }
+          );
+
+          await GroceryItem.deleteMany({ familyId: req.familyId, txnId: txn._id });
+          await GroceryItem.insertMany(
+            data.preparedItems.map((it) => ({
+              familyId: req.familyId,
+              txnId: txn._id,
+              ...it,
+            }))
+          );
+
+          return txn._id;
     });
-
-    await GroceryTransaction.updateOne(
-      { _id: txn._id, familyId: req.familyId },
-      {
-        $set: {
-          ...data.groceryFields,
-          transactionId: tx._id,
-          ledgerEntryId: entry._id,
-        },
-      }
-    );
-
-    await GroceryItem.deleteMany({ familyId: req.familyId, txnId: txn._id });
-    await GroceryItem.insertMany(
-      data.preparedItems.map((it) => ({
-        familyId: req.familyId,
-        txnId: txn._id,
-        ...it,
-      }))
-    );
-
-    res.json({ ok: true, txnId: txn._id });
+    res.json({ ok: true, txnId });
   } catch (e) {
     // Duplicate source unique index can happen only if old duplicate ledger rows exist.
     // Run /api/ledger/normalize for that month if you see duplicate key error.
@@ -414,23 +444,41 @@ router.put("/:id", requireAuth, requireFamily, async (req, res) => {
 
 // DELETE /api/grocery/:id
 router.delete("/:id", requireAuth, requireFamily, async (req, res) => {
-  const txn = await GroceryTransaction.findOne({ _id: req.params.id, familyId: req.familyId });
-  if (!txn) return res.status(404).json({ ok: false, message: "Not found" });
+  try {
+    await runAtomicPosting(async () => {
+      const txn = await GroceryTransaction.findOne({ _id: req.params.id, familyId: req.familyId });
+      if (!txn) throw postingError("Grocery entry not found", 404);
+      await requireOpenMonth(req.familyId, txn.month);
+      const linked = txn.transactionId
+        ? await Transaction.findOne({ _id: txn.transactionId, familyId: req.familyId })
+        : null;
+      if (linked?.month) await requireOpenMonth(req.familyId, linked.month);
 
-  await GroceryItem.deleteMany({ familyId: req.familyId, txnId: txn._id });
-
-  if (txn.ledgerEntryId) {
-    await Split.deleteMany({ familyId: req.familyId, ledgerEntryId: txn.ledgerEntryId });
-    await LedgerEntry.deleteOne({ _id: txn.ledgerEntryId, familyId: req.familyId });
+      // Delete all and only the linked records. A failed deletion rolls everything back.
+      if (txn.ledgerEntryId && !txn.transactionId) {
+        throw postingError("Grocery has a Ledger entry but no linked cash transaction; inspect before deleting", 409);
+      }
+      if (txn.transactionId && !linked) {
+        throw postingError("Grocery references a missing cash transaction; inspect before deleting", 409);
+      }
+      await GroceryItem.deleteMany({ familyId: req.familyId, txnId: txn._id });
+      if (txn.ledgerEntryId) {
+        const entry = await LedgerEntry.findOne({ _id: txn.ledgerEntryId, familyId: req.familyId });
+        if (entry && (!txn.transactionId || String(entry.sourceId) !== String(txn.transactionId))) {
+          throw postingError("Grocery ledger linkage is inconsistent; resolve before deletion", 409);
+        }
+        if (entry) {
+          await Split.deleteMany({ familyId: req.familyId, ledgerEntryId: entry._id });
+          await LedgerEntry.deleteOne({ _id: entry._id, familyId: req.familyId });
+        }
+      }
+      if (linked) await Transaction.deleteOne({ _id: linked._id, familyId: req.familyId });
+      await GroceryTransaction.deleteOne({ _id: txn._id, familyId: req.familyId });
+    });
+    res.json({ ok: true });
+  } catch (error) {
+    res.status(error.status || 500).json({ ok: false, message: error.message || "Grocery delete failed" });
   }
-
-  if (txn.transactionId) {
-    await Transaction.deleteOne({ _id: txn.transactionId, familyId: req.familyId });
-  }
-
-  await GroceryTransaction.deleteOne({ _id: txn._id });
-
-  res.json({ ok: true });
 });
 
 export default router;

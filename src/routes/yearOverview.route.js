@@ -1,250 +1,83 @@
-import mongoose from "mongoose";
-import { Router } from "express";
-import { requireAuth } from "../middlewares/auth.js";
-import { requireFamily } from "../middlewares/familyGuard.js";
-
-import Account from "../models/Account.js";
-import Transaction from "../models/Transaction.js";
-import LedgerEntry from "../models/LedgerEntry.js";
-import { cleanupPendingInstallmentLedgers } from "../utils/installmentLedger.js";
+import mongoose from 'mongoose';
+import { Router } from 'express';
+import { requireAuth } from '../middlewares/auth.js';
+import { requireFamily } from '../middlewares/familyGuard.js';
+import LedgerEntry from '../models/LedgerEntry.js';
+import Transaction from '../models/Transaction.js';
+import Account from '../models/Account.js';
+import { loadSharedBudgetMonth } from '../utils/sharedBudgetReadModel.js';
+import { calculateMonthlyLiquidFlow } from '../utils/monthlyLiquidFlow.js';
+import { loadReconciledMonth } from '../utils/reconciledAccounts.js';
+import { summarizeLiquidBalances } from '../utils/reconciledAccountMath.js';
+import { makeMonthlyReport, sumYearReport } from '../utils/reportingMath.js';
 
 const router = Router();
 
-function round2(n) {
-  return Math.round((Number(n) + Number.EPSILON) * 100) / 100;
+function validYear(value) {
+  const year = Number(value);
+  return Number.isInteger(year) && year >= 2000 && year <= 2100 ? year : null;
 }
+function key(year, month) { return `${year}-${String(month).padStart(2, '0')}`; }
 
-function monthKey(year, m) {
-  return `${year}-${String(m).padStart(2, "0")}`;
-}
-
-function monthStartEnd(year, m) {
-  const start = new Date(year, m - 1, 1, 0, 0, 0, 0);
-  const end = new Date(year, m, 1, 0, 0, 0, 0);
-  return { start, end };
-}
-
-async function totalBalanceAtDate(familyObjectId, cutoffDate, openingSum, includedAccountIds) {
-  const cutoff = new Date(cutoffDate);
-
-  const inflowRows = await Transaction.aggregate([
-    {
-      $match: {
-        familyId: familyObjectId,
-        date: { $lt: cutoff },
-        toAccountId: { $in: includedAccountIds },
-        txType: { $in: ["income", "transfer"] },
-      },
-    },
-    { $group: { _id: null, total: { $sum: "$amount" } } },
-  ]);
-
-  const outflowRows = await Transaction.aggregate([
-    {
-      $match: {
-        familyId: familyObjectId,
-        date: { $lt: cutoff },
-        fromAccountId: { $in: includedAccountIds },
-        txType: { $in: ["expense", "transfer"] },
-      },
-    },
-    { $group: { _id: null, total: { $sum: "$amount" } } },
-  ]);
-
-  const inflow = Number(inflowRows?.[0]?.total || 0);
-  const outflow = Number(outflowRows?.[0]?.total || 0);
-
-  return round2(Number(openingSum || 0) + inflow - outflow);
-}
-
-function parseYear(y) {
-  const n = Number(y);
-  if (!Number.isFinite(n) || n < 2000 || n > 2100) return null;
-  return n;
-}
-
-router.get("/", requireAuth, requireFamily, async (req, res) => {
+/** Read only: loading reports must never create/delete financial records. */
+router.get('/', requireAuth, requireFamily, async (req, res) => {
   try {
-    const year = parseYear(req.query.year) ?? new Date().getFullYear();
-
-    const startMonth = `${year}-01`;
-    const endMonth = `${year}-12`;
-
-    const familyObjectId = new mongoose.Types.ObjectId(req.familyId);
-
-    // Keep legacy pending EMI/shared-purchase schedules out of yearly budget totals.
-    await cleanupPendingInstallmentLedgers(req.familyId);
-
-    // Monthly income/expense comes from LedgerEntry, which is the source of truth
-    // for financial responsibility and planned monthly spending.
-    const ledgerRows = await LedgerEntry.aggregate([
-      {
-        $match: {
-          familyId: familyObjectId,
-          month: { $gte: startMonth, $lte: endMonth },
-        },
-      },
-      {
-        $group: {
-          _id: { month: "$month", entryType: "$entryType" },
-          total: { $sum: "$amountTotal" },
-        },
-      },
+    const year = req.query.year == null ? new Date().getFullYear() : validYear(req.query.year);
+    if (!year) return res.status(400).json({ ok: false, message: 'Valid year (2000–2100) required' });
+    const familyId = new mongoose.Types.ObjectId(req.familyId);
+    const minMonth = key(year, 1), maxMonth = key(year, 12);
+    const [accounts, allTransactions, allLedgerEntries] = await Promise.all([
+      Account.find({ familyId }).select('_id type name owner isActive').lean(),
+      Transaction.find({ familyId, month: { $gte: minMonth, $lte: maxMonth } })
+        .select('_id month txType amount sourceType paymentMode paymentParts fromAccountId toAccountId').lean(),
+      LedgerEntry.find({ familyId, month: { $gte: minMonth, $lte: maxMonth } }).lean(),
     ]);
-
-    const ledgerMap = {};
-    for (const row of ledgerRows) {
-      const month = row._id.month;
-      const entryType = row._id.entryType;
-      if (!ledgerMap[month]) ledgerMap[month] = {};
-      ledgerMap[month][entryType] = Number(row.total || 0);
+    const txByMonth = new Map(), entriesByMonth = new Map();
+    for (const tx of allTransactions) {
+      if (!txByMonth.has(tx.month)) txByMonth.set(tx.month, []);
+      txByMonth.get(tx.month).push(tx);
     }
-
-    // Transfers are real account movements. Include managed reimbursements even
-    // when budgetImpact=false; they must not become income/expense, but they are
-    // still genuine transfers between accounts.
-    const transferRows = await Transaction.aggregate([
-      {
-        $match: {
-          familyId: familyObjectId,
-          month: { $gte: startMonth, $lte: endMonth },
-          txType: "transfer",
-        },
-      },
-      { $group: { _id: "$month", total: { $sum: "$amount" } } },
-    ]);
-
-    const transferMap = Object.create(null);
-    for (const row of transferRows) {
-      transferMap[String(row._id)] = Number(row.total || 0);
+    for (const entry of allLedgerEntries) {
+      if (!entriesByMonth.has(entry.month)) entriesByMonth.set(entry.month, []);
+      entriesByMonth.get(entry.month).push(entry);
     }
-
-    // Savings growth = transfers into savings - transfers out of savings
-    const savingsAccounts = await Account.find({
-      familyId: familyObjectId,
-      type: "savings",
-      isActive: true,
-    })
-      .select("_id")
-      .lean();
-
-    const cashAccounts = await Account.find({
-      familyId: familyObjectId,
-      isActive: true,
-      type: { $ne: "savings" }, // ✅ exclude savings from Opening/Closing
-    })
-      .select("_id openingBalance")
-      .lean();
-
-    const cashAccountIds = cashAccounts.map((a) => a._id);
-
-    const openingSum = cashAccounts.reduce((s, a) => s + Number(a.openingBalance || 0), 0);
-
-    const savingsIds = savingsAccounts.map((x) => x._id);
-
-    const savingsInRows = await Transaction.aggregate([
-      {
-        $match: {
-          familyId: familyObjectId,
-          month: { $gte: startMonth, $lte: endMonth },
-          txType: "transfer",
-          toAccountId: { $in: savingsIds },
-        },
-      },
-      { $group: { _id: "$month", total: { $sum: "$amount" } } },
-    ]);
-
-    const savingsOutRows = await Transaction.aggregate([
-      {
-        $match: {
-          familyId: familyObjectId,
-          month: { $gte: startMonth, $lte: endMonth },
-          txType: "transfer",
-          fromAccountId: { $in: savingsIds },
-        },
-      },
-      { $group: { _id: "$month", total: { $sum: "$amount" } } },
-    ]);
-
-    const savingsInMap = Object.create(null);
-    const savingsOutMap = Object.create(null);
-    for (const r of savingsInRows) savingsInMap[String(r._id)] = Number(r.total || 0);
-    for (const r of savingsOutRows) savingsOutMap[String(r._id)] = Number(r.total || 0);
-
+    // The household closes months on Bangladesh local dates, not server UTC.
+    const dhakaParts = new Intl.DateTimeFormat('en-US', {
+      timeZone: 'Asia/Dhaka', year: 'numeric', month: '2-digit',
+    }).formatToParts(new Date());
+    const datePart = (type) => dhakaParts.find((part) => part.type === type)?.value;
+    const currentMonth = `${datePart('year')}-${datePart('month')}`;
     const months = [];
+    const reconciliation = [];
     for (let i = 1; i <= 12; i++) {
-      const m = monthKey(year, i);
-      const { start, end } = monthStartEnd(year, i);
-      const openingBalance = await totalBalanceAtDate(
-        familyObjectId,
-        start,
-        openingSum,
-        cashAccountIds
-      );
-
-      const closingBalance = await totalBalanceAtDate(
-        familyObjectId,
-        end,
-        openingSum,
-        cashAccountIds
-      );
-
-      const income = round2(ledgerMap[m]?.income || 0);
-      const expense = round2(ledgerMap[m]?.expense || 0);
-      const transfer = round2(transferMap[m] || 0);
-      const netCashflow = round2(income - expense);
-
-      const savingsIn = round2(savingsInMap[m] || 0);
-      const savingsOut = round2(savingsOutMap[m] || 0);
-      const savingsGrowth = round2(savingsIn - savingsOut);
-
-      const savingsRate = income > 0 ? round2((savingsIn / income) * 100) : 0;
-
-      months.push({
-        month: m,
-        income,
-        expense,
-        transfer,
-        netCashflow,
-        savingsIn,
-        savingsOut,
-        savingsGrowth,
-        savingsRate,
-        openingBalance,
-        closingBalance,
+      const month = key(year, i);
+      const [budgetView, snapshot] = await Promise.all([
+        loadSharedBudgetMonth(req.familyId, month, entriesByMonth.get(month) || []),
+        month <= currentMonth ? loadReconciledMonth(req.familyId, month) : Promise.resolve(null),
+      ]);
+      const monthTransactions = txByMonth.get(month) || [];
+      const cashFlow = calculateMonthlyLiquidFlow(accounts, monthTransactions);
+      const row = makeMonthlyReport({
+        month, accounts, transactions: monthTransactions,
+        budgetEntries: budgetView.entries, cashFlow,
+        openingBalance: snapshot ? summarizeLiquidBalances(snapshot.opening.accounts).total : null,
+        closingBalance: snapshot ? summarizeLiquidBalances(snapshot.closing.accounts).total : null,
+        budgetIssues: budgetView.summary.issues,
       });
+      row.warningCount += snapshot?.issues?.length || 0;
+      row.closed = !!snapshot?.closed;
+      row.isFuture = month > currentMonth;
+      if (row.warningCount) reconciliation.push({ month, warningCount: row.warningCount });
+      months.push(row);
     }
-
-    const totals = months.reduce(
-      (acc, x) => {
-        acc.income += x.income;
-        acc.expense += x.expense;
-        acc.transfer += x.transfer;
-        acc.netCashflow += x.netCashflow;
-        acc.savingsIn += x.savingsIn;
-        acc.savingsOut += x.savingsOut;
-        acc.savingsGrowth += x.savingsGrowth;
-        return acc;
-      },
-      {
-        income: 0,
-        expense: 0,
-        transfer: 0,
-        netCashflow: 0,
-        savingsIn: 0,
-        savingsOut: 0,
-        savingsGrowth: 0,
-      }
-    );
-
-    for (const k of Object.keys(totals)) totals[k] = round2(totals[k]);
-    totals.savingsRate = totals.income > 0 ? round2((totals.savingsIn / totals.income) * 100) : 0;
-
-    res.json({ ok: true, year, months, totals });
+    res.json({ ok: true, year, months, totals: sumYearReport(months), reconciliation,
+      reportingBasis: { budget: 'posted_regular_ledger_plus_scheduled_large_purchases',
+        cash: 'posted_liquid_account_transactions',
+        openingClosing: 'reconciled_month_end_account_balances',
+        note: 'Budget obligations are not cash outflows until paid. Transfers between liquid accounts are not income.' } });
   } catch (err) {
-    console.error("YearOverview Error:", err);
-    res.status(500).json({ ok: false, message: "Server error" });
+    console.error('YearOverview Error:', err);
+    res.status(500).json({ ok: false, message: 'Failed to load annual report' });
   }
 });
-
 export default router;
