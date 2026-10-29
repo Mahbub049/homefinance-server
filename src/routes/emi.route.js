@@ -12,6 +12,8 @@ import Category from "../models/Category.js";
 import Account from "../models/Account.js";
 import MonthlyBalance from "../models/MonthlyBalance.js";
 import { auditEmiRecords } from "../utils/emiIntegrity.js";
+import { writableMonth } from "../utils/carryForwardRules.js";
+import { normalizeEmiPaymentFunding, parseEmiPaymentDate } from "../utils/emiPaymentFunding.js";
 
 import {
   splitEqual,
@@ -375,12 +377,31 @@ async function resolveEmiExpenseCategory(familyId, expenseCategoryId) {
   return cat;
 }
 
+// Step 05: generated bills must never silently change a manually corrected
+// historical month or a formally closed month. This creates no cash entry.
+async function ensureEditableEmiBillMonth(familyId, month) {
+  if (!writableMonth(String(month || ''))) {
+    const err = new Error('Only October 2026 and later valid months can receive new EMI bills. Historical months are protected.');
+    err.status = 409;
+    throw err;
+  }
+  const closed = await MonthlyBalance.exists({
+    familyId, month, closingBalance: { $ne: null },
+  });
+  if (closed) {
+    const err = new Error('This month is already closed. EMI bills cannot be generated in a closed month.');
+    err.status = 409;
+    throw err;
+  }
+}
+
 async function generateInstallmentsForPlans({
   familyId,
   month,
   expenseCategoryId,
   planIds = null,
 }) {
+  await ensureEditableEmiBillMonth(familyId, month);
   const cat = await resolveEmiExpenseCategory(familyId, expenseCategoryId);
 
   if (!cat) {
@@ -573,16 +594,14 @@ async function refuseClosedMonth(familyId, month, session) {
 
 router.put("/installments/:id/status", requireAuth, requireFamily, async (req, res) => {
   try {
-    const { status, paidByUserId, fromAccountId, paidDate } = req.body || {};
+    const { status, paidByUserId, fromAccountId, paidDate, paymentMode, paymentParts } = req.body || {};
     if (!["paid", "pending"].includes(status)) {
       return res.status(400).json({ ok: false, message: "Invalid status" });
     }
-    if (status === "paid" && (!paidByUserId || !fromAccountId)) {
-      return res.status(400).json({ ok: false, message: "Select both a paying family member and a payment account" });
-    }
-    const payDate = status === "paid" ? (paidDate ? new Date(paidDate) : new Date()) : null;
-    if (status === "paid" && Number.isNaN(payDate.getTime())) {
-      return res.status(400).json({ ok: false, message: "Invalid payment date" });
+    let payDate = null;
+    if (status === "paid") {
+      try { payDate = parseEmiPaymentDate(paidDate); }
+      catch (err) { return res.status(400).json({ ok: false, message: err.message }); }
     }
 
     const updated = await runAtomicEmiWrite(async (session) => {
@@ -602,25 +621,16 @@ router.put("/installments/:id/status", requireAuth, requireFamily, async (req, r
         if (previouslyPosted) emiConflict("A linked transaction already exists. Duplicate EMI payment blocked; inspect the integrity report.");
         const plan = await EMIPlan.findOne({ _id: inst.planId, familyId: req.familyId }).session(session);
         if (!plan) emiConflict("Missing EMI plan; cannot safely record a payment");
-        const account = await Account.findOne({ _id: fromAccountId, familyId: req.familyId, isActive: true }).session(session);
-        if (!account || !["cash", "bank", "wallet"].includes(account.type)) {
-          const err = new Error("Select an active cash, bank or mobile-wallet payment account");
-          err.status = 400;
-          throw err;
-        }
-        const payer = await FamilyMember.findOne({ familyId: req.familyId, userId: paidByUserId }).session(session)
+        const familyMembers = await FamilyMember.find({ familyId: req.familyId }).session(session)
           .populate({ path: "userId", select: "name", options: { session } });
-        if (!payer) {
-          const err = new Error("Selected payer is not a family member");
-          err.status = 400;
-          throw err;
-        }
-        const owner = ownerFromMemberName(payer.userId?.name);
-        if ((!owner && account.owner !== "Joint") || (owner && account.owner !== owner && account.owner !== "Joint")) {
-          const err = new Error("Selected account does not belong to this payer");
-          err.status = 400;
-          throw err;
-        }
+        const fundingAccounts = await Account.find({ familyId: req.familyId, isActive: true }).session(session);
+        let funding;
+        try {
+          funding = normalizeEmiPaymentFunding({
+            paymentMode, paidByUserId, fromAccountId, paymentParts,
+            totalAmount: Number(inst.amount), familyMembers, accounts: fundingAccounts,
+          });
+        } catch (err) { err.status = 400; throw err; }
         const category = (inst.categoryId
           ? await Category.findOne({ _id: inst.categoryId, familyId: req.familyId, kind: "expense" }).session(session)
           : null) || (await Category.findOne({ familyId: req.familyId, kind: "expense", name: { $regex: /^\s*emi\s*$/i } }).session(session));
@@ -630,6 +640,7 @@ router.put("/installments/:id/status", requireAuth, requireFamily, async (req, r
           throw err;
         }
         const paidMonth = monthKey(payDate);
+        if (!writableMonth(paidMonth)) emiConflict('Payments dated before October 2026 are protected. Record a genuine new payment using its actual current date.');
         await refuseClosedMonth(req.familyId, paidMonth, session);
         const memberRows = await FamilyMember.find({ familyId: req.familyId }).select("userId").session(session).lean();
         const userIds = memberRows.map(r => String(r.userId));
@@ -641,9 +652,9 @@ router.put("/installments/:id/status", requireAuth, requireFamily, async (req, r
         const [tx] = await Transaction.create([{
           familyId: req.familyId, txType: "expense", date: payDate, month: paidMonth,
           categoryId: category._id, amount: Number(inst.amount), note,
-          fromAccountId: account._id, toAccountId: null, paidByUserId,
-          receivedByUserId: null, paymentMode: "single",
-          paymentParts: [{ userId: paidByUserId, accountId: account._id, amount: Number(inst.amount) }],
+          fromAccountId: funding.fromAccountId, toAccountId: null, paidByUserId: funding.paidByUserId,
+          receivedByUserId: null, paymentMode: funding.paymentMode,
+          paymentParts: funding.paymentParts,
           split: normalizedEmiSplit(plan, shareRows), budgetImpact: true,
           ledgerEligible: true, settlementImpact: true, sourceType: "emi_installment",
           sourceId: inst._id, createdByUserId: req.user.userId,
@@ -651,7 +662,7 @@ router.put("/installments/:id/status", requireAuth, requireFamily, async (req, r
         const [entry] = await LedgerEntry.create([{
           familyId: req.familyId, entryType: "expense", financialType: "debt",
           module: "emi", date: payDate, month: paidMonth, categoryId: category._id,
-          amountTotal: Number(inst.amount), paidByUserId, receivedByUserId: null,
+          amountTotal: Number(inst.amount), paidByUserId: funding.paidByUserId, receivedByUserId: null,
           note, sourceType: "transaction", sourceId: tx._id,
           createdByUserId: req.user.userId,
         }], { session });
@@ -660,7 +671,7 @@ router.put("/installments/:id/status", requireAuth, requireFamily, async (req, r
           userId: row.userId, shareAmount: Number(row.shareAmount),
         })), { session });
         inst.status = "paid";
-        inst.paidByUserId = paidByUserId;
+        inst.paidByUserId = funding.paidByUserId;
         inst.paidAt = payDate;
         inst.categoryId = category._id;
         inst.transactionId = tx._id;
@@ -686,6 +697,7 @@ router.put("/installments/:id/status", requireAuth, requireFamily, async (req, r
         || entry.sourceType !== "transaction" || String(entry.sourceId) !== String(tx._id)) {
         emiConflict("EMI payment references are inconsistent. Nothing was removed; review the integrity report.");
       }
+      if (!writableMonth(tx.month)) emiConflict('Historical EMI payments before October 2026 cannot be reversed.');
       await refuseClosedMonth(req.familyId, tx.month, session);
       await Split.deleteMany({ familyId: req.familyId, ledgerEntryId: entry._id }).session(session);
       await LedgerEntry.deleteOne({ familyId: req.familyId, _id: entry._id }).session(session);
@@ -720,6 +732,8 @@ router.delete("/installments/:id", requireAuth, requireFamily, async (req, res) 
       if (inst.status !== "pending" || inst.transactionId || inst.ledgerEntryId) {
         emiConflict("Only an unpaid, unlinked generated EMI bill can be deleted");
       }
+      if (!writableMonth(inst.month)) emiConflict('Historical generated bills before October 2026 are protected.');
+      await refuseClosedMonth(req.familyId, inst.month, session);
       const linkedTx = await Transaction.findOne({ familyId: req.familyId, sourceType: "emi_installment", sourceId: inst._id }).session(session).lean();
       if (linkedTx) emiConflict("Found a linked transaction: deletion blocked to protect financial history");
       await EMIInstallment.deleteOne({ _id: inst._id, familyId: req.familyId, status: "pending" }).session(session);
