@@ -15,6 +15,7 @@ import transactionRouter from "./routes/transaction.route.js";
 
 import fixedRouter from "./routes/fixed.route.js";
 import groceryRouter from "./routes/grocery.route.js";
+import groceryChecklistRouter from "./routes/groceryChecklist.route.js";
 import groceryShopRouter from "./routes/groceryShop.route.js";
 import emiRouter from "./routes/emi.route.js";
 import dashboardRouter from "./routes/dashboard.route.js";
@@ -86,6 +87,7 @@ app.use("/api/transactions", transactionRouter);
 
 app.use("/api/fixed", fixedRouter);
 app.use("/api/grocery", groceryRouter);
+app.use("/api/grocery-checklist", groceryChecklistRouter);
 app.use("/api/grocery-shops", groceryShopRouter);
 app.use("/api/emi", emiRouter);
 app.use("/api/dashboard", dashboardRouter);

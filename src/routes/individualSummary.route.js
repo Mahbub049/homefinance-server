@@ -137,6 +137,7 @@ router.get("/", requireAuth, requireFamily, async (req, res) => {
       return res.status(400).json({ ok: false, message: "Valid month (YYYY-MM) required" });
     }
 
+    const topLimit = Math.min(100, Math.max(1, Number.parseInt(req.query.topLimit, 10) || 10));
     const familyObjectId = new mongoose.Types.ObjectId(req.familyId);
 
     const members = await FamilyMember.find({ familyId: familyObjectId })
@@ -364,12 +365,12 @@ router.get("/", requireAuth, requireFamily, async (req, res) => {
       state.categoryBreakdown = Array.from(categoryMap.values())
         .map((row) => ({ ...row, amount: round2(row.amount), count: Number(row.count || 0) }))
         .sort((a, b) => b.amount - a.amount)
-        .slice(0, 8);
+        .slice(0, 20);
 
       state.dailyTrend = state.dailyTrend.map((row) => ({ ...row, amount: round2(row.amount) }));
       state.topExpenses = state.topExpenses
         .sort((a, b) => Number(b.paidAmount || b.totalAmount || 0) - Number(a.paidAmount || a.totalAmount || 0))
-        .slice(0, 10);
+        .slice(0, topLimit);
 
       state.summary.income = round2(state.summary.income);
       state.summary.spent = round2(state.summary.spent);
