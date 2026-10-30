@@ -15,6 +15,10 @@ import { positiveMoney } from '../utils/postingRules.js';
 import { requireOpenMonth } from '../utils/postingPreflight.js';
 import { existingFinancialPosting, createIdempotentFinancialPosting } from '../utils/idempotentFinancialPosting.js';
 
+import SavingsAutoRule from '../models/SavingsAutoRule.js';
+import SavingsAutoExecution from '../models/SavingsAutoExecution.js';
+import {runSavingsAuto} from '../utils/runSavingsAuto.js';
+import {bdClock} from '../utils/savingsAutoRules.js';
 const router = Router();
 
 function parseMonth(month) {
@@ -76,7 +80,6 @@ function round2(value) {
 router.get("/accounts", requireAuth, requireFamily, async (req, res) => {
   const items = await Account.find({
     familyId: req.familyId,
-    isActive: true,
     type: { $in: ["savings", "investment"] },
   }).sort({ name: 1 });
 
@@ -105,7 +108,6 @@ router.get("/overview", requireAuth, requireFamily, async (req, res) => {
 
   const savingsAccounts = await Account.find({
     familyId: req.familyId,
-    isActive: true,
     type: { $in: ["savings", "investment"] },
   }).sort({ name: 1 });
 
@@ -585,6 +587,76 @@ router.get("/yearly-summary", requireAuth, requireFamily, async (req, res) => {
       message: e?.message || "Savings yearly summary failed",
     });
   }
+});
+
+// Scheduled savings setup; no banking API is connected.
+router.get('/auto/rules',requireAuth,requireFamily,async(req,res)=>{
+  const items=await SavingsAutoRule.find({familyId:req.familyId}).sort({createdAt:-1}).lean();
+  res.json({ok:true,items});
+});
+router.post('/auto/rules',requireAuth,requireFamily,async(req,res)=>{
+  try {
+    const {paidByUserId,fromAccountId,toAccountId,amount,dayOfMonth,startMonth,endMonth,note}=req.body||{};
+    const day=Number(dayOfMonth), amt=Number(amount);
+    if(!Number.isInteger(day)||day<1||day>31||!Number.isFinite(amt)||amt<=0||!/^\d{4}-(0[1-9]|1[0-2])$/.test(String(startMonth))||(endMonth&&!/^\d{4}-(0[1-9]|1[0-2])$/.test(String(endMonth)))||(endMonth&&endMonth<startMonth))
+      return res.status(400).json({ok:false,message:'টাকা, তারিখ বা মেয়াদ সঠিক নয়।'});
+    if(String(startMonth)<bdClock().monthKey) return res.status(409).json({ok:false,message:'অতীতের মাস থেকে স্বয়ংক্রিয় এন্ট্রি চালু করা যাবে না।'});
+    if(String(startMonth)===bdClock().monthKey && day<bdClock().day) return res.status(409).json({ok:false,message:'এই মাসের নির্ধারিত দিন পার হয়ে গেছে; পরের মাস থেকে নিয়ম শুরু করুন।'});
+    await verifySavingsPosting({familyId:req.familyId,date:new Date(`${startMonth}-15T12:00:00.000Z`),paidByUserId,fromAccountId,toAccountId,amount:amt});
+    const item=await SavingsAutoRule.create({familyId:req.familyId,paidByUserId,fromAccountId,toAccountId,amount:amt,dayOfMonth:day,startMonth,endMonth:endMonth||'',note:String(note||'').trim(),createdByUserId:req.user.userId});
+    res.status(201).json({ok:true,item});
+  }catch(error){res.status(error.status||500).json({ok:false,message:error.message||'নিয়ম সংরক্ষণ হয়নি।'});}
+});
+router.patch('/auto/rules/:id',requireAuth,requireFamily,async(req,res)=>{
+  try {
+    // Pause/resume only. Historical executed transfers are preserved.
+    if(typeof req.body?.active!=='boolean') return res.status(400).json({ok:false,message:'চালু বা বন্ধ নির্বাচন করুন।'});
+    const item=await SavingsAutoRule.findOneAndUpdate({familyId:req.familyId,_id:req.params.id},{$set:{active:req.body.active}},{new:true});
+    if(!item)return res.status(404).json({ok:false,message:'নিয়ম পাওয়া যায়নি।'});
+    res.json({ok:true,item});
+  }catch(error){res.status(500).json({ok:false,message:error.message});}
+});
+router.delete('/auto/rules/:id',requireAuth,requireFamily,async(req,res)=>{
+  const item=await SavingsAutoRule.findOne({familyId:req.familyId,_id:req.params.id});
+  if(!item)return res.status(404).json({ok:false,message:'নিয়ম পাওয়া যায়নি।'});
+  const used=await SavingsAutoExecution.exists({familyId:req.familyId,ruleId:item._id});
+  if(used){item.active=false;await item.save();return res.json({ok:true,archived:true});}
+  await item.deleteOne();res.json({ok:true});
+});
+router.get('/auto/history',requireAuth,requireFamily,async(req,res)=>{
+  const rows=await SavingsAutoExecution.find({familyId:req.familyId}).sort({createdAt:-1}).limit(36).lean();
+  res.json({ok:true,items:rows});
+});
+// Keep this endpoint private. It runs only from a protected external daily scheduler.
+router.get('/auto/run',async(req,res)=>{
+  const secret=process.env.CRON_SECRET;
+  if(!secret||req.get('Authorization')!==`Bearer ${secret}`)return res.status(401).json({ok:false,message:'Unauthorized'});
+  try {res.json({ok:true,...await runSavingsAuto()});}
+  catch(error){res.status(500).json({ok:false,message:error.message});}
+});
+
+router.get('/deposits',requireAuth,requireFamily,async(req,res)=>{
+  const rows=await Transaction.find({familyId:req.familyId,txType:'transfer',sourceType:{$in:['savings_deposit','savings_auto']}}).sort({date:-1}).limit(80).populate('fromAccountId','name').populate('toAccountId','name').lean();
+  res.json({ok:true,items:rows});
+});
+router.delete('/deposits/:id',requireAuth,requireFamily,async(req,res)=>{
+  try {
+    const tx=await Transaction.findOne({_id:req.params.id,familyId:req.familyId});
+    if(!tx||tx.txType!=='transfer'||!['savings_deposit','savings_auto'].includes(tx.sourceType))return res.status(404).json({ok:false,message:'এই সঞ্চয় এন্ট্রি ফেরত নেওয়া যাবে না।'});
+    if(tx.month<bdClock().monthKey||tx.month<'2026-10')return res.status(409).json({ok:false,message:'আগের মাসের এন্ট্রি পরিবর্তন করা যাবে না।'});
+    await requireOpenMonth(req.familyId,tx.month);
+    await mongoose.connection.transaction(async session=>{
+      const exists=await Transaction.findOne({_id:tx._id,familyId:req.familyId}).session(session);
+      if(!exists)throw new Error('এন্ট্রি ইতিমধ্যে মুছে গেছে।');
+      if(tx.sourceType==='savings_auto'){
+        // Keep execution record as a tombstone so cron does not post again.
+        const audit=await SavingsAutoExecution.findOne({familyId:req.familyId,transactionId:tx._id}).session(session);
+        if(!audit)throw new Error('স্বয়ংক্রিয় এন্ট্রির ইতিহাস নেই; পরিবর্তন বাতিল।');
+      }
+      await Transaction.deleteOne({_id:tx._id,familyId:req.familyId}).session(session);
+    });
+    res.json({ok:true});
+  }catch(error){res.status(error.status||500).json({ok:false,message:error.message||'এন্ট্রি ফেরত নেওয়া যায়নি।'});}
 });
 
 // Manual deposit as a transfer

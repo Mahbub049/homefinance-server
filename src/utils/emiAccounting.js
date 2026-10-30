@@ -1,3 +1,4 @@
+import { scheduleForPlan } from "./emiSchedule.js";
 import { round2, splitEqual, splitFixed, splitPersonal, splitRatio } from './splitCalc.js';
 
 function failure(message) {
@@ -101,15 +102,14 @@ export function summarizeEmiDues(plans, installments, selectedMonth) {
   let excludedClosedThisMonth = 0;
   let dueThrough = 0, unpaidThrough = 0, overdue = 0, dueThisMonth = 0, paidThrough = 0;
   for (const plan of plans) {
-    const closed = String(plan.status || 'active').toLowerCase() === 'closed';
+    const closed = String(plan.status || 'active').toLowerCase() !== 'active';
     let excludedCurrent = 0;
     let excludedUnverified = 0;
     const start = String(plan.startMonth || '');
     if (!/^\d{4}-(0[1-9]|1[0-2])$/.test(start)) continue;
-    const [y, m] = start.split('-').map(Number);
-    for (let i = 0; i < Number(plan.months || 0); i++) {
-      const date = new Date(Date.UTC(y, m - 1 + i, 1));
-      const dueMonth = `${date.getUTCFullYear()}-${String(date.getUTCMonth() + 1).padStart(2, '0')}`;
+    const schedule = scheduleForPlan(plan);
+    for (let i = 0; i < schedule.length; i++) {
+      const dueMonth = schedule[i];
       if (dueMonth > selectedMonth) break;
       const amount = amountForIndex(plan, i);
       const inst = installmentMap.get(`${id(plan._id)}:${dueMonth}`);

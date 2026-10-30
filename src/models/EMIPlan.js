@@ -16,7 +16,8 @@ const emiPlanSchema = new mongoose.Schema(
 
     months: { type: Number, required: true }, // duration
     startMonth: { type: String, required: true, index: true }, // YYYY-MM
-    endMonth: { type: String, required: true, index: true },   // YYYY-MM
+    endMonth: { type: String, required: true, index: true },
+    scheduleMonths: [{ type: String }], // explicit calendar after an intentional pause/resume   // YYYY-MM
 
     monthlyAmount: { type: Number, required: true }, // computed at creation
 
@@ -26,7 +27,7 @@ const emiPlanSchema = new mongoose.Schema(
     ratios: [{ userId: { type: mongoose.Schema.Types.ObjectId, ref: "User" }, ratio: Number }],
     fixed: [{ userId: { type: mongoose.Schema.Types.ObjectId, ref: "User" }, amount: Number }],
 
-    status: { type: String, enum: ["active", "closed"], default: "active" },
+    status: { type: String, enum: ["active", "paused", "closed"], default: "active" },
 
     note: { type: String, default: "" },
 

@@ -13,6 +13,7 @@ import Account from "../models/Account.js";
 import MonthlyBalance from "../models/MonthlyBalance.js";
 import { auditEmiRecords } from "../utils/emiIntegrity.js";
 import { writableMonth } from "../utils/carryForwardRules.js";
+import { scheduleForPlan, installmentIndexForMonth, buildResumedSchedule } from "../utils/emiSchedule.js";
 import { normalizeEmiPaymentFunding, parseEmiPaymentDate } from "../utils/emiPaymentFunding.js";
 
 import {
@@ -89,32 +90,13 @@ function getLastInstallmentAmount(plan) {
 }
 
 function getInstallmentAmountForMonth(plan, targetMonth) {
-  const idx = diffMonths(plan.startMonth, targetMonth);
+  const idx = installmentIndexForMonth(plan, targetMonth);
   return amountForIndex(plan, idx);
 }
 
 function getExpectedPaidAmountUntilMonth(plan, nowMonth) {
-  if (!plan.startMonth || !plan.endMonth) return 0;
-  if (nowMonth < plan.startMonth) return 0;
-
-  const total = Number(plan.totalPayable || 0);
-  const months = Number(plan.months || 0);
-  if (months <= 0) return 0;
-
-  let cur = nowMonth;
-  if (cur > plan.endMonth) cur = plan.endMonth;
-
-  const expectedMonths = diffMonthsInclusive(plan.startMonth, cur, plan.endMonth);
-  if (expectedMonths <= 0) return 0;
-
-  const regular = getRegularMonthlyAmount(plan);
-  const last = getLastInstallmentAmount(plan);
-
-  if (expectedMonths >= months) {
-    return round2(total);
-  }
-
-  return round2(expectedMonths * regular);
+  return round2(scheduleForPlan(plan).reduce((sum, dueMonth, index) =>
+    sum + (dueMonth <= nowMonth ? amountForIndex(plan, index) : 0), 0));
 }
 
 async function computePlanStats(familyId, plan) {
@@ -306,15 +288,73 @@ router.get("/integrity", requireAuth, requireFamily, async (req, res) => {
   }
 });
 
+// Editing old records never rewrites existing generated bills or payments.
+router.put('/plans/:id', requireAuth, requireFamily, async (req, res) => {
+  try {
+    const plan = await EMIPlan.findOne({ familyId: req.familyId, _id: req.params.id });
+    if (!plan) return res.status(404).json({ok:false,message:'পরিকল্পনা পাওয়া যায়নি।'});
+    const bills = await EMIInstallment.exists({familyId:req.familyId,planId:plan._id});
+    const metadata = ['productName','brand','category','note'];
+    for (const key of metadata) if (req.body?.[key] !== undefined) plan[key] = String(req.body[key] || '').trim();
+    if (!plan.productName) return res.status(400).json({ok:false,message:'পণ্যের নাম প্রয়োজন।'});
+    if (bills && ['months','startMonth','originalPrice','emiCharge','splitType','personalUserId','ratios','fixed']
+      .some(key => req.body?.[key] !== undefined && JSON.stringify(req.body[key]) !== JSON.stringify(plan[key]))) {
+      return res.status(409).json({ok:false,message:'এই পরিকল্পনার বিল তৈরি হয়েছে। মূল্য, মেয়াদ বা ভাগ পাল্টালে পুরোনো হিসাব বদলে যাবে। শুধু নাম, খাত ও নোট পরিবর্তন করুন।'});
+    }
+    if (!bills && ['months','startMonth','originalPrice','emiCharge','splitType'].some(key=>req.body?.[key] !== undefined)) {
+      const count=Number(req.body.months ?? plan.months);
+      const price=Number(req.body.originalPrice ?? plan.originalPrice);
+      const charge=Number(req.body.emiCharge ?? plan.emiCharge);
+      const start=String(req.body.startMonth ?? plan.startMonth);
+      if (!Number.isInteger(count) || count<1 || count>36 || !Number.isFinite(price) || price<=0 || !Number.isFinite(charge) || charge<0 || !/^\d{4}-(0[1-9]|1[0-2])$/.test(start)) return res.status(400).json({ok:false,message:'কিস্তির মূল্য/মেয়াদ সঠিক নয়।'});
+      const total=round2(price*(1+charge/100));
+      if (Math.round(total*100)<count) return res.status(400).json({ok:false,message:'মোট টাকা খুব কম।'});
+      const next={splitType:req.body.splitType ?? plan.splitType, personalUserId:req.body.personalUserId ?? plan.personalUserId, ratios:req.body.ratios ?? plan.ratios, fixed:req.body.fixed ?? plan.fixed};
+      const members=await FamilyMember.find({familyId:req.familyId}).select('userId').lean();
+      validatePlanSplit(next,members.map(m=>m.userId),newPlanRegularAmount(total,count));
+      Object.assign(plan,{originalPrice:price,emiCharge:charge,totalPayable:total,months:count,startMonth:start,endMonth:addMonths(start,count-1),monthlyAmount:newPlanRegularAmount(total,count),scheduleMonths:[],...next});
+    }
+    await plan.save();
+    res.json({ok:true,plan});
+  } catch(err) { res.status(err.status||500).json({ok:false,message:err.message||'পরিকল্পনা পরিবর্তন করা যায়নি।'}); }
+});
+
+// Explicit pause is different from completed/closed. Resume never changes a paid bill.
+router.post('/plans/:id/resume', requireAuth, requireFamily, async (req,res)=>{
+  try {
+    const resumeMonth=String(req.body?.resumeMonth || currentMonth());
+    const mode=String(req.body?.mode || 'from-now');
+    if (!['from-now','include-missed'].includes(mode)) return res.status(400).json({ok:false,message:'চালু করার পদ্ধতি সঠিক নয়।'});
+    if (!writableMonth(resumeMonth) || resumeMonth < currentMonth()) return res.status(409).json({ok:false,message:'চলতি বা ভবিষ্যতের মাস থেকে চালু করতে পারবেন।'});
+    const plan=await EMIPlan.findOne({familyId:req.familyId,_id:req.params.id});
+    if (!plan) return res.status(404).json({ok:false,message:'পরিকল্পনা পাওয়া যায়নি।'});
+    if (plan.status==='active') return res.status(409).json({ok:false,message:'কিস্তি ইতিমধ্যে চালু রয়েছে।'});
+    const bills=await EMIInstallment.find({familyId:req.familyId,planId:plan._id}).select('month status').lean();
+    if (mode==='from-now') {
+      const paidMonths=bills.filter(b=>b.status==='paid').map(b=>b.month);
+      const schedule=buildResumedSchedule(plan,paidMonths,resumeMonth);
+      const future=new Set(schedule);
+      const conflicts=bills.filter(b=>b.status==='pending');
+      if (conflicts.length) return res.status(409).json({ok:false,message:`পুরোনো ${conflicts.length}টি অবৈতনিক বিল আছে। এগুলো আগে বাতিল করুন, তারপর নতুন মাস থেকে চালু করুন।`});
+      plan.scheduleMonths=schedule;
+      plan.endMonth=schedule.at(-1);
+    }
+    plan.status='active';
+    await plan.save();
+    res.json({ok:true,plan});
+  } catch(err) {res.status(err.status||500).json({ok:false,message:err.message||'কিস্তি চালু করা যায়নি।'});}
+});
+
 router.put("/plans/:id/status", requireAuth, requireFamily, async (req, res) => {
   const { status } = req.body || {};
 
-  if (!["active", "closed"].includes(status)) {
+  if (!["active", "paused", "closed"].includes(status)) {
     return res.status(400).json({ ok: false, message: "Invalid status" });
   }
 
   const existing = await EMIPlan.findOne({ _id: req.params.id, familyId: req.familyId });
   if (!existing) return res.status(404).json({ ok: false, message: "Plan not found" });
+  if (status === "active" && existing.status !== "active") return res.status(409).json({ok:false,message:"বিরতির পর চালু করতে Resume ব্যবহার করুন।"});
   if (status === "closed") {
     const paid = await EMIInstallment.find({ familyId: req.familyId, planId: existing._id, status: "paid" }).select("amount").lean();
     const paidTotal = round2(paid.reduce((sum, row) => sum + Number(row.amount || 0), 0));
@@ -421,7 +461,7 @@ async function generateInstallmentsForPlans({
   let createdCount = 0;
 
   for (const p of plans) {
-    if (!monthInRange(month, p.startMonth, p.endMonth)) continue;
+    if (installmentIndexForMonth(p, month) < 0) continue;
 
     const exists = await EMIInstallment.findOne({
       familyId,
@@ -501,7 +541,7 @@ router.post("/plans/:id/generate", requireAuth, requireFamily, async (req, res) 
       });
     }
 
-    if (!monthInRange(month, plan.startMonth, plan.endMonth)) {
+    if (installmentIndexForMonth(plan, month) < 0) {
       return res.status(400).json({
         ok: false,
         message: `Selected month is outside this plan's active range (${plan.startMonth} to ${plan.endMonth})`,
