@@ -635,6 +635,26 @@ router.delete('/:purchaseId/installments/:installmentId/payment', requireAuth, r
   }
 });
 
+// Only user-facing metadata may be updated after a purchase has posted.
+// Monetary amount, schedule, shares, payer account and historical records stay immutable.
+router.put('/:purchaseId/details', requireAuth, requireFamily, async (req, res) => {
+  try {
+    const title = String(req.body?.title || '').trim();
+    const note = String(req.body?.note ?? '').trim();
+    if (!title || title.length > 160 || note.length > 1000) {
+      return res.status(400).json({ok:false,message:'নাম (১–১৬০ অক্ষর) এবং মন্তব্য (সর্বোচ্চ ১০০০ অক্ষর) দিন।'});
+    }
+    const unexpected = Object.keys(req.body || {}).filter(key => !['title','note'].includes(key));
+    if (unexpected.length) return res.status(400).json({ok:false,message:'এখানে শুধু নাম ও মন্তব্য পরিবর্তন করা যাবে।'});
+    const purchase = await SharedPurchase.findOne({familyId:req.familyId,_id:req.params.purchaseId});
+    if (!purchase) return res.status(404).json({ok:false,message:'কেনাকাটা পাওয়া যায়নি।'});
+    // This changes descriptive metadata only, never linked financial data.
+    purchase.title=title;purchase.note=note;
+    await purchase.save();
+    res.json({ok:true, purchase});
+  } catch(err) {res.status(err.status || 500).json({ok:false,message:err.message||'তথ্য পরিবর্তন করা যায়নি।'});}
+});
+
 router.delete('/:purchaseId', requireAuth, requireFamily, async (req, res) => {
   try {
     await runAtomicPosting(async () => {

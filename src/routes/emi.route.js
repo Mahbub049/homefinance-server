@@ -13,6 +13,7 @@ import Account from "../models/Account.js";
 import MonthlyBalance from "../models/MonthlyBalance.js";
 import { auditEmiRecords } from "../utils/emiIntegrity.js";
 import { writableMonth } from "../utils/carryForwardRules.js";
+import { runAtomicPosting, atomicPostingError } from "../utils/financialPostingTransaction.js";
 import { scheduleForPlan, installmentIndexForMonth, buildResumedSchedule } from "../utils/emiSchedule.js";
 import { normalizeEmiPaymentFunding, parseEmiPaymentDate } from "../utils/emiPaymentFunding.js";
 
@@ -289,6 +290,43 @@ router.get("/integrity", requireAuth, requireFamily, async (req, res) => {
 });
 
 // Editing old records never rewrites existing generated bills or payments.
+// Deleting a financial plan is permitted only before any installment has ever
+// been generated. Paid/unpaid history must be retained and cannot be erased here.
+router.delete('/plans/:id', requireAuth, requireFamily, async (req, res) => {
+  try {
+    await runAtomicPosting(async () => {
+      const plan = await EMIPlan.findOne({ familyId: req.familyId, _id: req.params.id });
+      if (!plan) {
+        const e = new Error('কিস্তির পরিকল্পনা পাওয়া যায়নি।'); e.status = 404; throw e;
+      }
+      if (!writableMonth(plan.startMonth)) {
+        const e = new Error('পুরোনো সংশোধিত মাসের কিস্তির পরিকল্পনা মুছতে পারবেন না।'); e.status = 409; throw e;
+      }
+      const [bills, attachedTransaction, attachedLedger] = await Promise.all([
+        EMIInstallment.exists({ familyId: req.familyId, planId: plan._id }),
+        Transaction.exists({ familyId: req.familyId, sourceId: plan._id }),
+        LedgerEntry.exists({ familyId: req.familyId, sourceId: plan._id }),
+      ]);
+      if (bills || attachedTransaction || attachedLedger) {
+        const e = new Error('এই পরিকল্পনায় বিলের ইতিহাস আছে। বিল মুছে বা পরিশোধ সংশোধন না করে পরিকল্পনা মুছতে পারবেন না।'); e.status = 409; throw e;
+      }
+      const closed = await MonthlyBalance.exists({ familyId: req.familyId, month: plan.startMonth,
+        $or: [{closedAt:{$ne:null}},{closingBalance:{$ne:null}}] });
+      if (closed) {
+        const e = new Error('মাসটি বন্ধ রয়েছে; পরিকল্পনা মুছতে পারবেন না।'); e.status = 409; throw e;
+      }
+      const deleted = await EMIPlan.deleteOne({ familyId: req.familyId, _id: plan._id });
+      if (deleted.deletedCount !== 1) {
+        const e = new Error('পরিকল্পনার তথ্য পরিবর্তিত হয়েছে। নতুন করে চেষ্টা করুন।'); e.status = 409; throw e;
+      }
+    });
+    return res.json({ ok: true });
+  } catch (err) {
+    const error = atomicPostingError(err);
+    res.status(error.status || 500).json({ ok: false, message: error.message || 'পরিকল্পনা মুছতে পারিনি।' });
+  }
+});
+
 router.put('/plans/:id', requireAuth, requireFamily, async (req, res) => {
   try {
     const plan = await EMIPlan.findOne({ familyId: req.familyId, _id: req.params.id });
