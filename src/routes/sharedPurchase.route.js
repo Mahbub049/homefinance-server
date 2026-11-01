@@ -24,6 +24,7 @@ import {
 } from "../utils/sharedPurchaseSafety.js";
 import { summarizePurchaseInstallments } from "../utils/sharedPurchaseSchedule.js";
 import { summarizeAllocationProgress } from "../utils/purchaseAllocationProgress.js";
+import {cents, splitCents, futureRemainder, canReviseFuture} from "../utils/sharedPurchaseRevisionRules.js";
 
 const router = Router();
 
@@ -342,6 +343,7 @@ router.get("/", requireAuth, requireFamily, async (req, res) => {
       return {
         ...plan,
         allocationHistory,
+        scheduleDueDay: new Date(rawRows.find(row=>row.month>=month && !row.paidAt)?.dueDate || plan.purchaseDate).getUTCDate(),
         // Keep the persisted plan status untouched; a legacy payment may need
         // reconciliation before "completed" is financially justified.
         stats: {
@@ -635,24 +637,153 @@ router.delete('/:purchaseId/installments/:installmentId/payment', requireAuth, r
   }
 });
 
-// Only user-facing metadata may be updated after a purchase has posted.
-// Monetary amount, schedule, shares, payer account and historical records stay immutable.
+// Edit description/category and optionally reschedule *unpaid future* allocations.
+// The original bank debit, price, members' lifetime shares, and posted reimbursements
+// are immutable. A single MongoDB transaction covers every changed schedule row.
 router.put('/:purchaseId/details', requireAuth, requireFamily, async (req, res) => {
   try {
     const title = String(req.body?.title || '').trim();
     const note = String(req.body?.note ?? '').trim();
-    if (!title || title.length > 160 || note.length > 1000) {
-      return res.status(400).json({ok:false,message:'নাম (১–১৬০ অক্ষর) এবং মন্তব্য (সর্বোচ্চ ১০০০ অক্ষর) দিন।'});
+    const categoryId = String(req.body?.categoryId || '');
+    const dueDay = req.body?.dueDay == null ? null : Number(req.body.dueDay);
+    const reviseSchedule = req.body?.reviseSchedule === true;
+    const effectiveMonth = String(req.body?.effectiveMonth || '');
+    const nextStartMonth = String(req.body?.nextStartMonth || '');
+    const remainingMonths = Number(req.body?.remainingMonths || 0);
+    const keys = ['title','note','categoryId','dueDay','reviseSchedule','effectiveMonth','nextStartMonth','remainingMonths','expectedUpdatedAt'];
+    if (Object.keys(req.body || {}).some(key => !keys.includes(key))) {
+      throw purchaseWriteError('অপ্রত্যাশিত তথ্য এসেছে। মূল দাম ও পরিশোধিত হিসাব এভাবে বদলানো যাবে না।');
     }
-    const unexpected = Object.keys(req.body || {}).filter(key => !['title','note'].includes(key));
-    if (unexpected.length) return res.status(400).json({ok:false,message:'এখানে শুধু নাম ও মন্তব্য পরিবর্তন করা যাবে।'});
-    const purchase = await SharedPurchase.findOne({familyId:req.familyId,_id:req.params.purchaseId});
-    if (!purchase) return res.status(404).json({ok:false,message:'কেনাকাটা পাওয়া যায়নি।'});
-    // This changes descriptive metadata only, never linked financial data.
-    purchase.title=title;purchase.note=note;
-    await purchase.save();
-    res.json({ok:true, purchase});
-  } catch(err) {res.status(err.status || 500).json({ok:false,message:err.message||'তথ্য পরিবর্তন করা যায়নি।'});}
+    if (!title || title.length > 160 || note.length > 1000) throw purchaseWriteError('সঠিক নাম ও মন্তব্য দিন।');
+    if (dueDay != null && (!Number.isInteger(dueDay) || dueDay < 1 || dueDay > 31)) throw purchaseWriteError('কিস্তির দিন ১–৩১ এর মধ্যে দিন।');
+    if (categoryId && !mongoose.isValidObjectId(categoryId)) throw purchaseWriteError('খরচের খাত সঠিক নয়।');
+    if (reviseSchedule && (!validMonth(effectiveMonth) || !validMonth(nextStartMonth) ||
+      !Number.isInteger(remainingMonths) || remainingMonths < 1 || remainingMonths > 120 || nextStartMonth < effectiveMonth)) {
+      throw purchaseWriteError('বাকি কিস্তির সময়সূচি বা মেয়াদ সঠিক নয়।');
+    }
+    const result = await runAtomicPosting(async () => {
+      const purchase = await SharedPurchase.findOne({_id:req.params.purchaseId, familyId:req.familyId});
+      if (!purchase) throw purchaseWriteError('কেনাকাটা পাওয়া যায়নি।',404);
+      if ((req.body?.expectedUpdatedAt && new Date(req.body.expectedUpdatedAt).getTime() !== new Date(purchase.updatedAt).getTime()) ||
+        (!req.body?.expectedUpdatedAt && (reviseSchedule || dueDay != null || categoryId))) {
+        throw purchaseWriteError('কেনাকাটার তথ্য অন্য কোথাও পরিবর্তন হয়েছে। রিফ্রেশ করে আবার চেষ্টা করুন।',409);
+      }
+      const oldRows = await SharedPurchaseInstallment.find({familyId:req.familyId,purchaseId:purchase._id})
+        .sort({month:1,userId:1});
+      if (!oldRows.length) throw purchaseWriteError('কিস্তির হিসাব পাওয়া যায়নি; সম্পাদনা বন্ধ রাখা হয়েছে।',409);
+      const clock = new Intl.DateTimeFormat('en-GB',{timeZone:'Asia/Dhaka',year:'numeric',month:'2-digit'})
+        .formatToParts(new Date());
+      const currentMonth = `${clock.find(p=>p.type==='year')?.value}-${clock.find(p=>p.type==='month')?.value}`;
+      const protectedBefore = currentMonth > '2026-10' ? currentMonth : '2026-10';
+      if (reviseSchedule && effectiveMonth < protectedBefore) {
+        throw purchaseWriteError('আগের বা বর্তমানে বন্ধ মাসের কিস্তির সময়সূচি পরিবর্তন করা যাবে না।',409);
+      }
+      const existingDay = new Date(oldRows.find(row=>row.month>=protectedBefore)?.dueDate || purchase.purchaseDate).getUTCDate();
+      const effectiveDay = dueDay == null ? existingDay : dueDay;
+      const touchingSchedule = reviseSchedule || effectiveDay !== existingDay ||
+        (categoryId && categoryId !== String(purchase.categoryId));
+      const changesStart = reviseSchedule ? effectiveMonth : protectedBefore;
+      const changedRows = touchingSchedule ? oldRows.filter(row => row.month >= changesStart && (reviseSchedule || canReviseFuture(row))) : [];
+      if (reviseSchedule && !changedRows.length) throw purchaseWriteError('এখন থেকে বদলানোর মতো কোনো কিস্তি নেই।',409);
+      if (reviseSchedule && changedRows.some(row => !canReviseFuture(row))) {
+        throw purchaseWriteError('নির্বাচিত সময়ের কিস্তিতে ইতিমধ্যে payment বা পুরোনো অসম্পূর্ণ record আছে। সেগুলো পরিবর্তন করা যাবে না।',409);
+      }
+      const monthsToChange = changedRows.map(row => row.month);
+      if (reviseSchedule) for(let i=0;i<remainingMonths;i++) monthsToChange.push(addMonths(nextStartMonth,i));
+      if (changedRows.length) await requireOpenPurchaseMonths(req.familyId, monthsToChange);
+      const sameCategory = categoryId && categoryId === String(purchase.categoryId);
+      const category = categoryId && !sameCategory ? await Category.findOne({familyId:req.familyId,_id:categoryId,kind:'expense',isActive:{$ne:false}}) : null;
+      if (categoryId && !sameCategory && !category) throw purchaseWriteError('নির্বাচিত খরচের খাত পাওয়া যায়নি।');
+      const nextCategory = category?._id || purchase.categoryId;
+
+      // Inspect all expected future allocation links BEFORE deleting anything.
+      // A legacy orphaned Ledger row must never be discarded silently.
+      if (changedRows.length) {
+        const existing = await LedgerEntry.find({familyId:req.familyId,sourceType:'shared_purchase_installment',
+          sourceId:{$in:changedRows.map(r=>r._id)}}).select('_id sourceId').lean();
+        const expected = new Set(changedRows.filter(r=>!r.paymentRequired).map(r=>String(r._id)));
+        if (existing.length !== expected.size || existing.some(r=>!expected.has(String(r.sourceId)))) {
+          throw purchaseWriteError('কিস্তির Ledger হিসাব মিলছে না। আগে যাচাই করে সংশোধন করুন।',409);
+        }
+      }
+      const own = changedRows.filter(row => !row.paymentRequired);
+      const linkedIds=[];
+      for (const row of own) {
+        const entry = row.ledgerEntryId ? await LedgerEntry.findOne({familyId:req.familyId,_id:row.ledgerEntryId}) : null;
+        requireLinkedDocument(entry,{sourceType:'shared_purchase_installment',sourceId:row._id,label:'Future allocation'});
+        if (cents(entry.amountTotal) !== cents(row.amount)) throw purchaseWriteError('একটি কিস্তির allocation হিসাব মিলছে না। পরিবর্তন করা হয়নি।',409);
+        const all=await LedgerEntry.find({familyId:req.familyId,sourceType:'shared_purchase_installment',sourceId:row._id});
+        if(all.length!==1) throw purchaseWriteError('একটি কিস্তিতে একাধিক Ledger record রয়েছে। আগে যাচাই করুন।',409);
+        const splits=await Split.find({familyId:req.familyId,ledgerEntryId:entry._id}).lean();
+        if(splits.length!==1 || String(splits[0].userId)!==String(row.userId) || cents(splits[0].shareAmount)!==cents(row.amount)) {
+          throw purchaseWriteError('ভবিষ্যতের কিস্তির ভাগ ও Ledger হিসাব মিলছে না। পরিবর্তন করা হয়নি।',409);
+        }
+        linkedIds.push(entry._id);
+      }
+      if (reviseSchedule) {
+        const preserved = oldRows.filter(row => row.month < effectiveMonth);
+        const newDocs=[];
+        const priorMonths=new Set(preserved.map(row=>row.month)).size;
+        if (priorMonths + remainingMonths > 120) throw purchaseWriteError('সর্বোচ্চ ১২০টি নির্ধারিত মাস রাখা যাবে।');
+        for (const share of purchase.shares) {
+          const past=preserved.filter(row=>String(row.userId)===String(share.userId));
+          const balance= futureRemainder(share.shareAmount,past);
+          if (balance < remainingMonths) throw purchaseWriteError('প্রতি মাসে শূন্য টাকার কিস্তি রাখা যাবে না। মাস সংখ্যা কমান।');
+          const monthly= splitCents(balance,remainingMonths);
+          for (let index=0;index<remainingMonths;index++) {
+            const month=addMonths(nextStartMonth,index);
+            newDocs.push({familyId:req.familyId,purchaseId:purchase._id,userId:share.userId,
+              month,dueDate:dueDateForMonth(month,effectiveDay),amount:monthly[index],
+              paymentRequired:String(share.userId)!==String(purchase.payerUserId),
+              status:String(share.userId)===String(purchase.payerUserId)?'allocated':'pending',
+            });
+          }
+        }
+        await Split.deleteMany({familyId:req.familyId,ledgerEntryId:{$in:linkedIds}});
+        await LedgerEntry.deleteMany({familyId:req.familyId,_id:{$in:linkedIds}});
+        await SharedPurchaseInstallment.deleteMany({familyId:req.familyId,_id:{$in:changedRows.map(r=>r._id)}});
+        const inserted=await SharedPurchaseInstallment.insertMany(newDocs);
+        const ownNew=inserted.filter(row=>!row.paymentRequired);
+        if(ownNew.length){
+          const entries=await LedgerEntry.insertMany(ownNew.map(row=>({familyId:req.familyId,
+            entryType:'expense',financialType:'debt',module:'shared_purchase',date:row.dueDate,month:row.month,
+            categoryId:nextCategory,amountTotal:row.amount,affectsSettlement:false,
+            paidByUserId:row.userId,receivedByUserId:null,note:`${title} · monthly allocation`,
+            sourceType:'shared_purchase_installment',sourceId:row._id,createdByUserId:req.user.userId,
+          })));
+          await Split.insertMany(entries.map((entry,i)=>({familyId:req.familyId,ledgerEntryId:entry._id,
+            userId:ownNew[i].userId,shareAmount:ownNew[i].amount})));
+          await SharedPurchaseInstallment.bulkWrite(ownNew.map((row,i)=>({updateOne:{
+            filter:{familyId:req.familyId,_id:row._id},update:{$set:{ledgerEntryId:entries[i]._id}},
+          }})));
+        }
+        purchase.months=priorMonths+remainingMonths;
+        purchase.endMonth=addMonths(nextStartMonth,remainingMonths-1);
+        for(const share of purchase.shares){
+          const past=preserved.filter(row=>String(row.userId)===String(share.userId));
+          share.monthlyAmount=splitCents(futureRemainder(share.shareAmount,past),remainingMonths)[0];
+        }
+      } else {
+        for (const row of own) {
+          await LedgerEntry.updateOne({familyId:req.familyId,_id:row.ledgerEntryId},{$set:{
+            categoryId:nextCategory,note:`${title} · monthly allocation`,date:dueDateForMonth(row.month,effectiveDay),
+          }});
+        }
+        for (const row of changedRows) {
+          row.dueDate=dueDateForMonth(row.month,effectiveDay);
+          await row.save();
+        }
+      }
+      purchase.title=title;purchase.note=note;purchase.categoryId=nextCategory;
+      await purchase.save();
+      await refreshPurchaseStatus(purchase._id,req.familyId);
+      return purchase._id;
+    });
+    res.json({ok:true,purchaseId:result, message:reviseSchedule?'ভবিষ্যতের কিস্তি নতুন করে সাজানো হয়েছে।':'কেনাকাটার তথ্য পরিবর্তন হয়েছে।'});
+  } catch (error) {
+    const normalized=atomicPostingError(error);
+    res.status(normalized.status||500).json({ok:false,message:normalized.message||'কেনাকাটা পরিবর্তন করা যায়নি।'});
+  }
 });
 
 router.delete('/:purchaseId', requireAuth, requireFamily, async (req, res) => {

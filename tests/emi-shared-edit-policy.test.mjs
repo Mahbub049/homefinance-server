@@ -9,11 +9,15 @@ test('EMI delete requires history protection and explicit route',()=>{
  assert.match(emi,/writableMonth\(plan\.startMonth\)/);
  assert.match(emi,/runAtomicPosting/);
 });
-test('shared purchase metadata edit never updates the monetary fields',()=>{
+test('shared purchase revision protects upfront money and paid history',()=>{
  const marker=shared.indexOf("router.put('/:purchaseId/details'");
  assert.ok(marker>=0);
  const code=shared.slice(marker,shared.indexOf("router.delete('/:purchaseId'",marker));
- assert.match(code,/\['title','note'\]/);
- assert.match(code,/purchase\.title=title;purchase\.note=note/);
- assert.doesNotMatch(code,/purchase\.(totalAmount|months|shares|payerAccountId)\s*=/);
+ assert.match(code,/expectedUpdatedAt/);
+ assert.match(code,/runAtomicPosting/);
+ assert.match(code,/requireOpenPurchaseMonths/);
+ assert.match(code,/canReviseFuture/);
+ assert.match(code,/futureRemainder/);
+ assert.match(code,/purchase\.months=priorMonths\+remainingMonths/);
+ assert.doesNotMatch(code,/purchase\.(totalAmount|payerAccountId|payerUserId|purchaseDate)\s*=/);
 });
