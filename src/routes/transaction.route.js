@@ -4,6 +4,7 @@ import { requireAuth } from "../middlewares/auth.js";
 import { requireFamily } from "../middlewares/familyGuard.js";
 
 import Transaction from "../models/Transaction.js";
+import ManualTransactionBatch from "../models/ManualTransactionBatch.js";
 import Category from "../models/Category.js";
 import LedgerEntry from "../models/LedgerEntry.js";
 import Split from "../models/Split.js";
@@ -607,6 +608,71 @@ router.get("/summary", requireAuth, requireFamily, async (req, res) => {
   out.netCashflow = round2(out.income - out.expense);
 
   res.json({ ok: true, totals: out });
+});
+
+// Daily bulk entry: all rows share the selected date, but retain separate
+// Transaction, LedgerEntry and Split records. One invalid row rejects the whole
+// request; an atomic commit plus a stable idempotency key prevents partial and
+// duplicate financial postings, including when an HTTP response is lost.
+const MAX_DAILY_ENTRIES = 30;
+router.post("/batch", requireAuth, requireFamily, async (req, res) => {
+  try {
+    const { date, entries } = req.body || {};
+    const validDate = typeof date === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(date) &&
+      !Number.isNaN(Date.parse(`${date}T12:00:00Z`)) &&
+      new Date(`${date}T12:00:00Z`).toISOString().slice(0, 10) === date;
+    if (!validDate) return res.status(400).json({ ok: false, message: 'Select a valid date for all entries.' });
+    if (!Array.isArray(entries) || entries.length < 2 || entries.length > MAX_DAILY_ENTRIES)
+      return res.status(400).json({ ok: false, message: `Add between 2 and ${MAX_DAILY_ENTRIES} entries.` });
+
+    const month = date.slice(0, 7);
+    if (month < '2026-10') return res.status(409).json({ ok: false, message: 'Months before October 2026 are protected.' });
+
+    // Never let a row override the chosen day, or silently skip an invalid row.
+    // Validate every row with the exact same rules used for single-item posts.
+    const validated = [];
+    for (let i = 0; i < entries.length; i += 1) {
+      if (!entries[i] || typeof entries[i] !== 'object' || Array.isArray(entries[i]))
+        return res.status(400).json({ ok: false, row: i + 1, message: `হিসাব ${i + 1}: তথ্য সঠিক নয়।` });
+      const check = await validateTransactionInput(req, { ...entries[i], date });
+      if (!check.ok) return res.status(400).json({ ok: false, row: i + 1, message: `হিসাব ${i + 1}: ${check.message}` });
+      validated.push(check.payload);
+    }
+
+    const result = await createIdempotentFinancialPosting(req, 'manual.transaction.batch', async () => {
+      await requireOpenMonth(req.familyId, month);
+      const transactionIds = [];
+      for (const payload of validated) {
+        const tx = await Transaction.create({
+          familyId: req.familyId, txType: payload.txType, date: new Date(payload.date),
+          month: payload.month, categoryId: payload.categoryId, amount: payload.amount,
+          note: payload.note, fromAccountId: payload.fromAccountId,
+          toAccountId: payload.toAccountId, paidByUserId: payload.paidByUserId,
+          receivedByUserId: payload.receivedByUserId, paymentMode: payload.paymentMode,
+          paymentParts: payload.paymentParts, split: payload.split,
+          sourceType: 'manual', createdByUserId: req.user.userId,
+        });
+        await syncTransactionLedger({ req, tx, payload });
+        transactionIds.push(tx._id);
+      }
+      const receipt = await ManualTransactionBatch.create({
+        familyId: req.familyId,
+        date: new Date(date), month, transactionIds,
+        createdByUserId: req.user.userId,
+      });
+      return receipt._id;
+    });
+    const receipt = await ManualTransactionBatch.findOne({
+      _id: result.resultId, familyId: req.familyId,
+    }).lean();
+    if (!receipt) throw new Error('Saved batch receipt could not be retrieved.');
+    return res.status(result.replayed ? 200 : 201).json({
+      ok: true, savedCount: receipt.transactionIds.length,
+      transactionIds: receipt.transactionIds, replayed: result.replayed,
+    });
+  } catch (e) {
+    return res.status(e.status || 500).json({ ok: false, message: e.message || 'Batch save failed; no entries were saved.' });
+  }
 });
 
 // Manual creation is fully atomic: Transaction + LedgerEntry + Split, or none.

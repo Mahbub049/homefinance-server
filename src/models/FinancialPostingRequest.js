@@ -3,7 +3,7 @@ import mongoose from 'mongoose';
 // New records only. No edits or backfill of historical transactions.
 const financialPostingRequestSchema = new mongoose.Schema({
   familyId: { type: mongoose.Schema.Types.ObjectId, ref: 'Family', required: true },
-  operation: { type: String, enum: ['grocery.create', 'savings.deposit', 'creditCard.payment', 'manual.transaction.create', 'wallet.settlement', 'wallet.pastPending', 'sharedPurchase.create', 'sharedPurchase.pay'], required: true },
+  operation: { type: String, enum: ['grocery.create', 'savings.deposit', 'creditCard.payment', 'manual.transaction.create', 'manual.transaction.batch', 'wallet.settlement', 'wallet.pastPending', 'sharedPurchase.create', 'sharedPurchase.pay'], required: true },
   key: { type: String, required: true },
   payloadHash: { type: String, required: true },
   resultId: { type: mongoose.Schema.Types.ObjectId, default: null },
